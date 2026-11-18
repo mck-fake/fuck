@@ -11,6 +11,7 @@ import {
   RouteQueryFailureBanner,
 } from '@/components/error'
 import { ThemeProvider } from '@/components/providers/ThemeProvider'
+import { I18nProvider } from '@/components/providers/I18nProvider'
 import { ThemeWrapper } from '@/components/theme/ThemeWrapper'
 import { ProjectsProvider } from '@/contexts/ProjectsContext'
 import { PresetProvider } from '@/contexts/PresetContext'
@@ -27,7 +28,12 @@ import {
   QueryClientProvider,
 } from '@tanstack/react-query'
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
-import { lazy, Suspense, useEffect } from 'react'
+import { lazy, Suspense, useEffect, useMemo } from 'react'
+import {
+  BrandIcon,
+  BrandingEffects,
+  BrandName,
+} from '@/components/branding/Brand'
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
@@ -422,6 +428,16 @@ const OnDemandTlsPage = lazy(() =>
 const DiskMonitoringPage = lazy(() =>
   import('./pages/settings/DiskMonitoringPage').then((m) => ({
     default: m.DiskMonitoringPage,
+  }))
+)
+const BrandingPage = lazy(() =>
+  import('./pages/settings/BrandingPage').then((m) => ({
+    default: m.BrandingPage,
+  }))
+)
+const CustomRolesPage = lazy(() =>
+  import('./pages/settings/CustomRolesPage').then((m) => ({
+    default: m.CustomRolesPage,
   }))
 )
 const BuildLimitsPage = lazy(() =>
@@ -987,7 +1003,9 @@ const FullAppRoutes = () => {
                             path="teams/:teamId"
                             element={<TeamDetail />}
                           />
+                          <Route path="roles" element={<CustomRolesPage />} />
                           <Route path="auth" element={<AuthSettingsPage />} />
+                          <Route path="branding" element={<BrandingPage />} />
                           <Route
                             path="auth/new"
                             element={<CreateOidcProviderPage />}
@@ -1599,12 +1617,15 @@ export const TempsConsole = ({
 }: TempsConsoleProps) => {
   client.setConfig({ baseUrl })
 
-  // Our own HTML shell declares `lang="en"`; an edition that mounts the
-  // console in its own shell may not. The console's text is English, so
-  // declare it unless the host page already chose a language (WCAG 3.1.1).
-  useEffect(() => {
-    if (!document.documentElement.lang) document.documentElement.lang = 'en'
-  }, [])
+  // Instance branding fills the logo slots unless an extension already does.
+  const brandedExtensions = useMemo<ConsoleExtensions>(
+    () => ({
+      logoText: <BrandName />,
+      logoIcon: <BrandIcon />,
+      ...extensions,
+    }),
+    [extensions]
+  )
 
   // An API failure nobody awaited with a `catch` would otherwise end as an
   // "uncaught exception: Object" with nothing on screen.
@@ -1617,16 +1638,19 @@ export const TempsConsole = ({
   )
 
   return (
-    <ThemeProvider defaultTheme="system" enableSystem attribute="class">
-      <ThemeWrapper>
-        <QueryClientProvider client={queryClient}>
-          <ConsoleExtensionsProvider extensions={extensions}>
-            <AppContent />
-          </ConsoleExtensionsProvider>
-        </QueryClientProvider>
-        <Toaster position="top-center" />
-      </ThemeWrapper>
-    </ThemeProvider>
+    <I18nProvider>
+      <ThemeProvider defaultTheme="system" enableSystem attribute="class">
+        <ThemeWrapper>
+          <QueryClientProvider client={queryClient}>
+            <ConsoleExtensionsProvider extensions={brandedExtensions}>
+              <BrandingEffects />
+              <AppContent />
+            </ConsoleExtensionsProvider>
+          </QueryClientProvider>
+          <Toaster position="top-center" />
+        </ThemeWrapper>
+      </ThemeProvider>
+    </I18nProvider>
   )
 }
 

@@ -20,18 +20,22 @@ import {
 import { Input } from '@/components/ui/input'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Cloud, Loader2, Lock } from 'lucide-react'
-import type { ComponentType, SVGProps } from 'react'
+import { useMemo, type ComponentType, type SVGProps } from 'react'
 import { useForm } from 'react-hook-form'
 import { SiAuth0, SiGoogle, SiKeycloak, SiOkta } from 'react-icons/si'
 import { Link } from 'react-router'
 import { z } from 'zod'
+import { useI18n } from '@/components/providers/I18nProvider'
+import { en, format, type Messages } from '@/lib/i18n'
 
-const loginSchema = z.object({
-  email: z.string().email('Please enter a valid email address'),
-  password: z.string().min(1, 'Password is required'),
-})
+// Built per language so validation messages follow the selected one.
+const loginSchemaFor = (t: Messages) =>
+  z.object({
+    email: z.string().email(t.auth.invalidEmail),
+    password: z.string().min(1, t.auth.passwordRequired),
+  })
 
-type LoginFormData = z.infer<typeof loginSchema>
+type LoginFormData = z.infer<ReturnType<typeof loginSchemaFor>>
 
 export type OidcProviderOption = {
   /**
@@ -95,11 +99,14 @@ function providerIcon(
  * so the button reads as the console-access handoff it actually is,
  * not an ordinary corporate-IdP SSO button.
  */
-export function providerButtonLabel(provider: OidcProviderOption): string {
+export function providerButtonLabel(
+  provider: OidcProviderOption,
+  t: Messages = en
+): string {
   if (provider.template === 'temps_cloud') {
-    return 'Continue with Temps Cloud'
+    return t.auth.continueWithCloud
   }
-  return `Sign in with ${provider.name}`
+  return format(t.auth.signInWith, { name: provider.name })
 }
 
 interface LoginFormProps {
@@ -118,12 +125,6 @@ interface LoginFormProps {
    * the <form> entirely instead of relying on validation.
    */
   passwordLoginEnabled?: boolean
-  /**
-   * Show the "Forgot password?" link next to the password field. Only
-   * true when the server has an email provider configured (reset links
-   * are emailed), so we don't link users to a flow that can't deliver.
-   */
-  passwordResetAvailable?: boolean
 }
 
 export function LoginForm({
@@ -131,8 +132,9 @@ export function LoginForm({
   isLoading,
   oidcProviders = [],
   passwordLoginEnabled = true,
-  passwordResetAvailable = false,
 }: LoginFormProps) {
+  const { t } = useI18n()
+  const loginSchema = useMemo(() => loginSchemaFor(t), [t])
   const form = useForm<LoginFormData>({
     resolver: zodResolver(loginSchema),
     defaultValues: {
@@ -152,10 +154,8 @@ export function LoginForm({
   return (
     <Card className="w-full max-w-sm">
       <CardHeader>
-        <CardTitle className="text-2xl">Login</CardTitle>
-        <CardDescription>
-          Enter your email and password to access your account
-        </CardDescription>
+        <CardTitle className="text-2xl">{t.auth.loginTitle}</CardTitle>
+        <CardDescription>{t.auth.loginDescription}</CardDescription>
       </CardHeader>
       <CardContent>
         {oidcProviders.length > 0 && (
@@ -176,14 +176,14 @@ export function LoginForm({
                       with the same label would make screen readers
                       say "Keycloak Sign in with Keycloak". */}
                   <Icon className="mr-2 h-4 w-4" aria-hidden="true" />
-                  {providerButtonLabel(provider)}
+                  {providerButtonLabel(provider, t)}
                 </Button>
               )
             })}
             {passwordLoginEnabled && (
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <div className="h-px flex-1 bg-border" />
-                or
+                {t.auth.or}
                 <div className="h-px flex-1 bg-border" />
               </div>
             )}
@@ -192,8 +192,7 @@ export function LoginForm({
 
         {!passwordLoginEnabled && oidcProviders.length === 0 && (
           <p className="text-sm text-muted-foreground">
-            Password sign-in is disabled and no SSO provider is configured on
-            this server. Contact your administrator.
+            {t.auth.passwordLoginDisabled}
           </p>
         )}
 
@@ -208,7 +207,7 @@ export function LoginForm({
                 name="email"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Email</FormLabel>
+                    <FormLabel>{t.auth.email}</FormLabel>
                     <FormControl>
                       <Input
                         type="email"
@@ -227,20 +226,19 @@ export function LoginForm({
                 render={({ field }) => (
                   <FormItem>
                     <div className="flex items-center justify-between">
-                      <FormLabel>Password</FormLabel>
-                      {passwordResetAvailable && (
-                        <Link
-                          to="/forgot-password"
-                          className="text-sm font-medium text-muted-foreground hover:text-foreground"
-                        >
-                          Forgot password?
-                        </Link>
-                      )}
+                      <FormLabel>{t.auth.password}</FormLabel>
+                      {/* Always reachable: without email the page explains the terminal reset. */}
+                      <Link
+                        to="/forgot-password"
+                        className="text-sm font-medium text-muted-foreground hover:text-foreground"
+                      >
+                        {t.auth.forgotPassword}
+                      </Link>
                     </div>
                     <FormControl>
                       <Input
                         type="password"
-                        placeholder="Enter your password"
+                        placeholder={t.auth.passwordPlaceholder}
                         disabled={isLoading}
                         {...field}
                       />
@@ -253,10 +251,10 @@ export function LoginForm({
                 {isLoading ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Signing in...
+                    {t.auth.signingIn}
                   </>
                 ) : (
-                  'Sign in'
+                  t.auth.signIn
                 )}
               </Button>
             </form>

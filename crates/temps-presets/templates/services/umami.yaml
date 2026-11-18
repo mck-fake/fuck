@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Umami web analytics as one container; websites, events and users live in a
+# Temps-managed PostgreSQL database.
+# Settings cross-checked against Coolify's umami.yaml template (https://github.com/coollabsio/coolify, Apache-2.0).
+slug: umami
+name: Umami
+version: 1.0.0
+kind: app
+description: Privacy-focused, cookie-free website analytics backed by a Temps-managed PostgreSQL database. It starts with the login admin / umami, so change that password right after deploying.
+git:
+  url: https://github.com/umami-software/umami.git
+  ref: v3.5.0
+preset: dockerfile
+image_url: /templates/umami.svg
+# Tag 3.5.0, multi-arch (linux/amd64, linux/arm64) index digest.
+image: ghcr.io/umami-software/umami@sha256:b64f40400d77bcadd39cf5c62a1e368c99524ca442024f96e1133355a19a5dbc
+resources:
+  cpu_request: 250000
+  cpu_limit: 1000000
+  memory_request: 256
+  memory_limit: 1024
+exposed_port: 3000
+health_check_path: /api/heartbeat
+tags:
+  - analytics
+  - privacy
+  - web-analytics
+  - marketing
+features:
+  - Cookie-free page view, event and referrer analytics
+  - Websites, events and users stored in Temps-managed PostgreSQL
+  - Database migrations applied automatically on every start
+  - Default login is admin / umami; change the password right after the first sign-in
+services:
+  - postgres
+managed_service_bindings:
+  postgres:
+    DATABASE_URL: POSTGRES_URL
+env_vars:
+  - name: APP_SECRET
+    description: Secret Umami uses to sign login tokens and hash visitor identifiers
+    required: true
+    secret: true
+    default_generator: random_hex_32
+is_public: true
+is_featured: false
+sort_order: 10

@@ -1098,6 +1098,43 @@ fn legacy_settings_json_without_require_mfa_for_admins_deserializes() {
 }
 
 #[test]
+fn password_login_disabled_is_off_by_default_and_for_legacy_rows() {
+    // Turning password sign-in off must be an explicit choice: a default or
+    // a row saved before the field existed must keep password login working.
+    assert!(!AppSettings::default().password_login_disabled);
+    let legacy = serde_json::json!({ "external_url": "https://paas.example.com" });
+    assert!(!AppSettings::from_json(legacy).password_login_disabled);
+
+    let on = AppSettings {
+        password_login_disabled: true,
+        ..AppSettings::default()
+    };
+    assert!(AppSettings::from_json(on.to_json()).password_login_disabled);
+}
+
+#[test]
+fn branding_is_empty_by_default_and_for_legacy_rows_and_round_trips() {
+    assert_eq!(AppSettings::default().branding, BrandingSettings::default());
+    let legacy = serde_json::json!({ "external_url": "https://paas.example.com" });
+    assert_eq!(
+        AppSettings::from_json(legacy).branding,
+        BrandingSettings::default()
+    );
+
+    let branded = AppSettings {
+        branding: BrandingSettings {
+            product_name: Some("Acme Cloud".into()),
+            primary_color: Some("#2563eb".into()),
+            ..BrandingSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    let back = AppSettings::from_json(branded.to_json());
+    assert_eq!(back.branding.product_name.as_deref(), Some("Acme Cloud"));
+    assert_eq!(back.branding.primary_color.as_deref(), Some("#2563eb"));
+}
+
+#[test]
 fn require_mfa_for_admins_round_trips_through_json() {
     let s = AppSettings {
         require_mfa_for_admins: true,

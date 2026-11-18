@@ -2434,6 +2434,7 @@ mod tests {
                     project: &project,
                     instance_rate_limiting: &instance,
                     ip_rules: &rows,
+                    instance_ip_default: None,
                 };
                 let snapshot = IngressSnapshot::build(
                     vec![environment_endpoint(1, &access, None, Vec::new())],

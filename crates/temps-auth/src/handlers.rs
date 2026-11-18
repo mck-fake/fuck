@@ -46,6 +46,13 @@ use crate::types::{
 };
 use temps_core::problemdetails::{new as problem_new, Problem};
 
+// The password-reset flow (request and verify) lives in its own file.
+mod password_reset;
+use password_reset::password_login_disabled_problem;
+pub use password_reset::{
+    __path_request_password_reset, __path_reset_password, request_password_reset, reset_password,
+};
+
 const MAX_LOGIN_EMAIL_BYTES: usize = 254;
 
 fn bounded_audit_identity(identity: &str) -> String {
@@ -1000,6 +1007,9 @@ pub struct RequiredPasswordChangeResponse {
 pub struct EmailStatusResponse {
     pub email_configured: bool,
     pub password_reset_available: bool,
+    /// False when the instance is SSO only; the login page then hides the
+    /// email and password form.
+    pub password_login_enabled: bool,
     pub oidc_providers: Vec<crate::oidc_types::OidcProviderSummary>,
 }
 
@@ -1090,6 +1100,7 @@ pub async fn register(
     responses(
         (status = 200, description = "Login successful, session cookie set", body = AuthResponse),
         (status = 401, description = "Invalid credentials, or the account's role requires MFA enrollment that has not been completed"),
+        (status = 403, description = "Password sign-in is disabled; the instance is SSO only"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Authentication"
@@ -1504,6 +1515,18 @@ pub async fn login(
                     .with_title("Invalid Credentials")
                     .with_detail("Invalid email or password."))
             }
+            crate::auth_service::UserAuthError::PasswordLoginDisabled => {
+                record_login_failure(
+                    state.as_ref(),
+                    &metadata,
+                    None,
+                    &login_email,
+                    "password",
+                    "password_login_disabled",
+                )
+                .await;
+                Err(password_login_disabled_problem())
+            }
             _ => {
                 // Log the real error server-side (email is PII but legitimate
                 // for login-failure auditing; never include password).
@@ -1540,6 +1563,7 @@ pub async fn login(
 )]
 pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStatusResponse> {
     let email_configured = state.auth_service.is_email_configured().await;
+    let password_login_enabled = state.auth_service.is_password_login_enabled().await;
     let oidc_providers = state
         .oidc_service
         .list_enabled_providers()
@@ -1548,122 +1572,10 @@ pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStat
 
     Json(EmailStatusResponse {
         email_configured,
-        password_reset_available: email_configured,
+        password_reset_available: email_configured && password_login_enabled,
+        password_login_enabled,
         oidc_providers,
     })
-}
-
-#[utoipa::path(
-    post,
-    path = "/auth/password-reset/request",
-    request_body = EmailRequest,
-    responses(
-        (status = 200, description = "Reset email sent if account exists", body = AuthResponse),
-        (status = 503, description = "Email service not configured")
-    ),
-    tag = "Authentication"
-)]
-pub async fn request_password_reset(
-    State(state): State<Arc<AuthState>>,
-    Json(body): Json<EmailRequest>,
-) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    if !state.auth_service.is_email_configured().await {
-        return Err(problem_new(StatusCode::SERVICE_UNAVAILABLE)
-            .with_title("Email Service Not Configured")
-            .with_detail("Password reset is not available without email configuration"));
-    }
-
-    let email = &body.email;
-
-    match state.auth_service.request_password_reset(email).await {
-        Ok(_) | Err(_) => {
-            // Always return success to prevent email enumeration
-            Ok(Json(AuthResponse {
-                success: true,
-                message:
-                    "If an account exists with this email, a password reset link has been sent"
-                        .to_string(),
-                user_id: None,
-                mfa_required: false,
-                mfa_enrollment_required: false,
-                mfa_setup: None,
-                password_change_required: false,
-            }))
-        }
-    }
-}
-
-#[utoipa::path(
-    post,
-    path = "/auth/password-reset/verify",
-    request_body = ResetPasswordRequest,
-    responses(
-        (status = 200, description = "Password reset successful", body = AuthResponse),
-        (status = 400, description = "Invalid or expired token"),
-        (status = 500, description = "Internal server error")
-    ),
-    tag = "Authentication"
-)]
-pub async fn reset_password(
-    State(state): State<Arc<AuthState>>,
-    Extension(metadata): Extension<RequestMetadata>,
-    Json(request): Json<ResetPasswordRequest>,
-) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    match state.auth_service.reset_password(request.into()).await {
-        Ok(user) => {
-            // Create audit log
-            let audit_context = AuditContext {
-                user_id: user.id,
-                ip_address: Some(metadata.ip_address.to_string()),
-                user_agent: metadata.user_agent.as_str().to_string(),
-            };
-
-            let password_reset_audit = PasswordResetAudit {
-                context: audit_context,
-                username: user.name.clone(),
-            };
-
-            if let Err(e) = state
-                .audit_service
-                .create_audit_log(&password_reset_audit)
-                .await
-            {
-                error!("Failed to create audit log: {}", e);
-            }
-
-            Ok(Json(AuthResponse {
-                success: true,
-                message: "Password reset successful. You can now login with your new password."
-                    .to_string(),
-                user_id: None,
-                mfa_required: false,
-                mfa_enrollment_required: false,
-                mfa_setup: None,
-                password_change_required: false,
-            }))
-        }
-        Err(crate::auth_service::UserAuthError::InvalidToken) => {
-            Err(problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Password Reset Failed")
-                .with_detail("The password reset link is invalid or expired."))
-        }
-        Err(crate::auth_service::UserAuthError::WeakPassword(message)) => {
-            Err(problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Password Requirements Not Met")
-                .with_detail(message))
-        }
-        Err(crate::auth_service::UserAuthError::SamePassword) => {
-            Err(problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Choose a Different Password")
-                .with_detail("Your new password must differ from the temporary password."))
-        }
-        Err(error) => {
-            error!(error = %error, "Password reset failed internally");
-            Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Password Reset Failed")
-                .with_detail("Could not reset the password. Please try again."))
-        }
-    }
 }
 
 #[utoipa::path(
@@ -3593,6 +3505,8 @@ mod tests {
     async fn invalid_credentials_are_audited_with_normalized_identity() {
         let audit = Arc::new(RecordingAuditLogger::default());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The SSO-only check reads the settings row first: none stored.
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
             .append_query_results([Vec::<users::Model>::new()])
             .into_connection();
         let state = auth_state_with_audit(db, audit.clone());

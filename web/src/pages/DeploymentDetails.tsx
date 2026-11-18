@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeploymentApprovalBanner } from '@/components/approvals/DeploymentApprovalBanner'
 import { DeploymentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
@@ -25,6 +26,7 @@ import { RetainedFailedContainers } from '@/components/deployments/RetainedFaile
 import { RollbackToLastSuccessful } from '@/components/deployments/RollbackToLastSuccessful'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Card, CardContent } from '@/components/ui/card'
 import { RefreshButton } from '@/components/ui/refresh-button'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -423,7 +425,43 @@ function VisitButton({
   )
 }
 
-function SecondaryActions({
+type ConfirmedAction = 'cancel' | 'pause' | 'rollback'
+
+// Each of these changes what serves traffic, so nothing is sent until the
+// user confirms. Resume only brings a paused deployment back and needs none.
+const ACTION_CONFIRMATIONS: Record<
+  ConfirmedAction,
+  {
+    title: (id: number) => string
+    description: string
+    confirmLabel: string
+    destructive: boolean
+  }
+> = {
+  cancel: {
+    title: (id) => `Cancel deployment #${id}?`,
+    description:
+      'Its build or rollout stops now. The deployment that is live keeps serving.',
+    confirmLabel: 'Cancel deployment',
+    destructive: true,
+  },
+  pause: {
+    title: (id) => `Pause deployment #${id}?`,
+    description:
+      'Its containers stop, so its URLs stop answering until you resume it.',
+    confirmLabel: 'Pause deployment',
+    destructive: true,
+  },
+  rollback: {
+    title: (id) => `Roll back to deployment #${id}?`,
+    description:
+      "It takes over the environment's traffic from the deployment that is live now.",
+    confirmLabel: 'Roll back',
+    destructive: false,
+  },
+}
+
+export function SecondaryActions({
   deployment,
   actions,
 }: {
@@ -431,6 +469,13 @@ function SecondaryActions({
   actions: OverviewActions
 }) {
   const showMenu = deploymentMenuHasActions(deployment)
+  const [confirming, setConfirming] = useState<ConfirmedAction | null>(null)
+  const runners: Record<ConfirmedAction, () => void> = {
+    cancel: actions.onCancel,
+    pause: actions.onPause,
+    rollback: actions.onRollback,
+  }
+  const confirmation = confirming ? ACTION_CONFIRMATIONS[confirming] : null
   return (
     <>
       <Button variant="outline" onClick={actions.onRedeploy} title="Redeploy">
@@ -448,7 +493,7 @@ function SecondaryActions({
             {(deployment.status === 'running' ||
               deployment.status === 'pending') && (
               <DropdownMenuItem
-                onClick={actions.onCancel}
+                onSelect={() => setConfirming('cancel')}
                 disabled={actions.cancelPending}
               >
                 <X className="mr-2 h-4 w-4" />
@@ -457,7 +502,7 @@ function SecondaryActions({
             )}
             {deployment.status === 'completed' && (
               <DropdownMenuItem
-                onClick={actions.onPause}
+                onSelect={() => setConfirming('pause')}
                 disabled={actions.pausePending}
               >
                 <Pause className="mr-2 h-4 w-4" />
@@ -466,7 +511,7 @@ function SecondaryActions({
             )}
             {canRollbackTo(deployment) && (
               <DropdownMenuItem
-                onClick={actions.onRollback}
+                onSelect={() => setConfirming('rollback')}
                 disabled={actions.rollbackPending}
               >
                 <RotateCcw className="mr-2 h-4 w-4" />
@@ -485,6 +530,20 @@ function SecondaryActions({
           </DropdownMenuContent>
         </DropdownMenu>
       )}
+      <ConfirmDialog
+        open={confirmation !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirming(null)
+        }}
+        title={confirmation?.title(deployment.id) ?? ''}
+        description={confirmation?.description ?? ''}
+        confirmLabel={confirmation?.confirmLabel}
+        destructive={confirmation?.destructive}
+        onConfirm={() => {
+          if (confirming) runners[confirming]()
+          setConfirming(null)
+        }}
+      />
     </>
   )
 }
@@ -1555,6 +1614,11 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           commitUrls={overviewProps.commitUrls}
           buildStats={buildStats}
           actions={overviewProps.actions}
+        />
+
+        <DeploymentApprovalBanner
+          projectId={deployment.project_id}
+          deploymentId={deployment.id}
         />
 
         {/* Failure/cancellation reason — prominent, directly under the header. */}

@@ -150,6 +150,7 @@ fn deciding_an_environment_request_through_its_compiled_endpoint_does_not_alloca
         project: &project,
         instance_rate_limiting: &instance,
         ip_rules: &rules,
+        instance_ip_default: None,
     };
     let stored = vec![
         AccessPolicy::IpRules {

@@ -905,6 +905,9 @@ impl AuthService {
         &self,
         request: LoginRequest,
     ) -> Result<temps_entities::users::Model, UserAuthError> {
+        // Checked before the account lookup: the policy is public (the login
+        // page shows it), so refusing early reveals nothing about accounts.
+        self.ensure_password_login_allowed().await?;
         // Every rejection below costs one Argon2 verification, the same as a
         // wrong password for a real account, so response time does not
         // reveal whether the email exists or has a password.
@@ -1085,7 +1088,7 @@ impl AuthService {
 
     // Request password reset
     pub async fn request_password_reset(&self, email: &str) -> Result<(), UserAuthError> {
-        // Check if email service is configured
+        self.ensure_password_login_allowed().await?;
         // Find user by email
         let user = temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::Email.eq(email.to_lowercase()))
@@ -1123,6 +1126,7 @@ impl AuthService {
         &self,
         request: ResetPasswordRequest,
     ) -> Result<temps_entities::users::Model, UserAuthError> {
+        self.ensure_password_login_allowed().await?;
         // Validate password complexity
         validate_password_complexity(&request.new_password)?;
 
@@ -1540,6 +1544,31 @@ impl AuthService {
         Uuid::new_v4().to_string()
     }
 
+    /// Whether the login page should offer email and password. Display only:
+    /// a lookup failure answers `true`, and every password path enforces the
+    /// setting itself through [`Self::ensure_password_login_allowed`].
+    pub async fn is_password_login_enabled(&self) -> bool {
+        match self.get_settings().await {
+            Ok(settings) => !settings.password_login_disabled,
+            Err(e) => {
+                error!(
+                    "Failed to read password_login_disabled for the login page: {}",
+                    e
+                );
+                true
+            }
+        }
+    }
+
+    /// Refuse a password-based sign-in path when the instance is SSO only.
+    /// Fails closed: a settings read error is returned, never treated as allowed.
+    async fn ensure_password_login_allowed(&self) -> Result<(), UserAuthError> {
+        if self.get_settings().await?.password_login_disabled {
+            return Err(UserAuthError::PasswordLoginDisabled);
+        }
+        Ok(())
+    }
+
     /// Get the application settings
     async fn get_settings(&self) -> Result<temps_config::AppSettings, sea_orm::DbErr> {
         let record = temps_entities::settings::Entity::find_by_id(1)
@@ -1678,6 +1707,11 @@ pub enum UserAuthError {
     SamePassword,
     #[error("Failed to determine roles for user {user_id}: {reason}")]
     RoleLookup { user_id: i32, reason: String },
+    /// The instance is SSO only (`AppSettings::password_login_disabled`).
+    #[error(
+        "Password sign-in is disabled on this instance (password_login_disabled); sign in with an SSO provider"
+    )]
+    PasswordLoginDisabled,
 }
 
 /// Detect a Postgres unique-constraint violation regardless of the specific
@@ -1947,6 +1981,96 @@ mod tests {
             crate::mfa_guard::test_support::encryption(),
         );
         Some((db, auth_service))
+    }
+
+    // --- SSO only (password_login_disabled) ---
+
+    /// An `AuthService` whose database answers the settings lookup with
+    /// `password_login_disabled: true` and records every query after it.
+    fn sso_only_auth(db: Arc<DatabaseConnection>) -> AuthService {
+        AuthService::new(
+            db,
+            Arc::new(MockEmailService::new()),
+            crate::mfa_guard::test_support::encryption(),
+        )
+    }
+
+    fn sso_only_settings_db() -> Arc<DatabaseConnection> {
+        Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![settings::Model {
+                    id: 1,
+                    data: serde_json::json!({ "password_login_disabled": true }),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                }]])
+                .into_connection(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sso_only_refuses_every_password_path_before_touching_accounts() {
+        let login = sso_only_auth(sso_only_settings_db())
+            .login(LoginRequest {
+                email: "user@example.com".to_string(),
+                password: "Password123!".to_string(),
+            })
+            .await;
+        assert!(matches!(login, Err(UserAuthError::PasswordLoginDisabled)));
+
+        let reset_request = sso_only_auth(sso_only_settings_db())
+            .request_password_reset("user@example.com")
+            .await;
+        assert!(matches!(
+            reset_request,
+            Err(UserAuthError::PasswordLoginDisabled)
+        ));
+
+        let db = sso_only_settings_db();
+        let reset = sso_only_auth(db.clone())
+            .reset_password(ResetPasswordRequest {
+                token: "reset-token".to_string(),
+                new_password: "NewPassword123!".to_string(),
+            })
+            .await;
+        assert!(matches!(reset, Err(UserAuthError::PasswordLoginDisabled)));
+        // Only the settings row was read: no account lookup, no token write.
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(log.len(), 1, "unexpected queries: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn sso_only_check_fails_closed_when_settings_cannot_be_read() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("settings unavailable".into())])
+                .into_connection(),
+        );
+        let result = sso_only_auth(db)
+            .login(LoginRequest {
+                email: "user@example.com".to_string(),
+                password: "Password123!".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(result, Err(UserAuthError::DatabaseError(_))),
+            "a settings read error must not let a password sign-in through: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_page_flag_follows_the_setting_and_defaults_to_enabled_on_error() {
+        assert!(
+            !sso_only_auth(sso_only_settings_db())
+                .is_password_login_enabled()
+                .await
+        );
+        let failing = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("settings unavailable".into())])
+                .into_connection(),
+        );
+        assert!(sso_only_auth(failing).is_password_login_enabled().await);
     }
 
     // Session Management Tests
@@ -4267,9 +4391,14 @@ mod tests {
         };
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // 1) `find().filter(email...)` in login() -> the user above
+            // 1) the SSO-only check's settings read -> no row. That check
+            //    fails closed on an error by design (see
+            //    `sso_only_check_fails_closed_when_settings_cannot_be_read`);
+            //    this test covers the later MFA-policy read, which degrades.
+            .append_query_results(vec![Vec::<settings::Model>::new()])
+            // 2) `find().filter(email...)` in login() -> the user above
             .append_query_results(vec![vec![user]])
-            // 2) `get_settings()`'s `settings::Entity::find_by_id(1)` -> DB error
+            // 3) the MFA-policy `get_settings()` -> DB error
             .append_query_errors(vec![sea_orm::DbErr::Custom(
                 "connection reset by peer".to_string(),
             )])

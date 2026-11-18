@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Rendered by the @BRAND@ installer; edits here are overwritten on the next run.
+# The file keeps the name temps.service because the binary reads exactly that
+# path (doctor, migrate, upgrade); operators use the @BRAND@.service alias.
+# It is world-readable, so it never holds a secret: the database URL lives in
+# @ETC@/temps.env (root, 0600).
+[Unit]
+Description=@BRAND@ platform server (Temps)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=@BRAND@
+Group=@BRAND@
+# serve opens GeoLite2-City.mmdb relative to its working directory, and setup
+# downloads it into the data dir.
+WorkingDirectory=@DATA@/data
+EnvironmentFile=@ETC@/temps.env
+Environment=HOME=@DATA@
+Environment=TEMPS_DATA_DIR=@DATA@/data
+Environment=TEMPS_ADDRESS=@HTTP_ADDR@
+Environment=TEMPS_TLS_ADDRESS=@TLS_ADDR@
+# info in production, debug in development.
+Environment=TEMPS_LOG_LEVEL=@LOG_LEVEL@
+# true on loopback installs: no certificate is issued for a loopback domain, so
+# redirecting apps to HTTPS would make every one of them unreachable.
+Environment=TEMPS_DISABLE_HTTPS_REDIRECT=@DISABLE_HTTPS_REDIRECT@
+# The console/admin API stays on loopback; the public console is served by the
+# proxy on the console.<domain> host.
+Environment=TEMPS_CONSOLE_ADDRESS=@CONSOLE_ADDR@
+ExecStart=@PREFIX@/bin/temps serve
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+# Binds :80/:443 as an unprivileged user, and installs the nftables rule that
+# keeps workloads away from cloud metadata (169.254.169.254).
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
+Alias=@BRAND@.service

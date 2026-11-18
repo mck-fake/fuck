@@ -7,8 +7,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
-import { listOidcProvidersOptions } from '@/api/client/@tanstack/react-query.gen'
-import { AuthSettingsPage } from './AuthSettingsPage'
+import {
+  getSettingsOptions,
+  listOidcProvidersOptions,
+} from '@/api/client/@tanstack/react-query.gen'
+import { AuthSettingsPage, ssoOnlyNotice } from './AuthSettingsPage'
 
 const refused = {
   title: 'Forbidden',
@@ -53,6 +56,26 @@ test('a refused provider list is not rendered as "no SSO providers configured"',
   expect(html).toContain('Requires settings:write permission')
   expect(html).not.toContain('No SSO providers configured')
   expect(html).not.toContain('Add SSO provider')
+  client.clear()
+})
+
+test('Require SSO explains why it cannot be turned on without an enabled provider', () => {
+  expect(ssoOnlyNotice(false, false)).toContain('Enable an SSO provider first')
+  expect(ssoOnlyNotice(true, false)).toContain('nobody can sign in')
+  expect(ssoOnlyNotice(false, true)).toBeNull()
+  expect(ssoOnlyNotice(true, true)).toBeNull()
+})
+
+test('Require SSO shows the stored state and the recovery command', () => {
+  const client = createClient()
+  client.setQueryData(providersKey, [])
+  client.setQueryData(getSettingsOptions().queryKey, {
+    password_login_disabled: false,
+  } as never)
+  const html = render(client)
+  expect(html).toContain('Require SSO')
+  expect(html).toContain('sudo temps reset-admin-password')
+  expect(html).toContain('Enable an SSO provider first')
   client.clear()
 })
 

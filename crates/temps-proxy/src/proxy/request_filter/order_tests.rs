@@ -1084,6 +1084,7 @@ fn enforce_endpoint(
         project: &project,
         instance_rate_limiting: &instance,
         ip_rules: &[],
+        instance_ip_default: None,
     };
     f.routes
         .set_ingress_snapshot_for_test(IngressSnapshot::build(

@@ -106,6 +106,14 @@ impl TempsPlugin for ConfigPlugin {
         })
     }
 
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        // The login page reads the console branding before anyone signs in.
+        let config_service = context.require_service::<ConfigService>();
+        Some(PluginRoutes::new(
+            crate::configure_public_routes().with_state(config_service),
+        ))
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Get the ConfigService from the context
         let config_service = context.require_service::<ConfigService>();

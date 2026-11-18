@@ -71,8 +71,8 @@ import {
   modeLabel,
   initialFormMode,
   missingPresets,
-  policySummary,
   presetsFit,
+  scopeBadge,
   probeDraft,
   probeScope,
   showsEntries,
@@ -99,7 +99,10 @@ const INHERIT_MODE: { value: IpAccessFormMode; hint: string } = {
 }
 
 const MODES: { value: IpAccessFormMode; hint: string }[] = [
-  { value: 'disabled', hint: 'Anyone can reach it. This is the default.' },
+  {
+    value: 'disabled',
+    hint: 'Anyone can reach it, even when an instance default list is set.',
+  },
   {
     value: 'allow',
     hint: 'Everyone else gets a 403. Use for private or internal apps.',
@@ -456,10 +459,14 @@ export function ProjectIpAccessCard({
     >
       <form onSubmit={onSubmit} className="space-y-5" noValidate>
         <div className="flex flex-wrap items-center gap-2">
-          <Badge variant={policy.mode === 'disabled' ? 'secondary' : 'default'}>
-            {isEnvironment && !policy.configured
-              ? 'Follows the project list'
-              : policySummary(policy.mode, policy.cidrs.length)}
+          <Badge
+            variant={
+              policy.mode === 'disabled' && !policy.instance_default_mode
+                ? 'secondary'
+                : 'default'
+            }
+          >
+            {scopeBadge(policy, isEnvironment)}
           </Badge>
           {isEnvironment && !policy.configured && (
             <span className="text-sm text-muted-foreground">
@@ -468,6 +475,18 @@ export function ProjectIpAccessCard({
             </span>
           )}
         </div>
+
+        {!policy.configured && policy.instance_default_mode && (
+          <Alert>
+            <CircleAlert className="h-4 w-4" />
+            <AlertTitle>The instance default list applies</AlertTitle>
+            <AlertDescription>
+              This {scopeNoun} has no list of its own, so the instance default (
+              {modeLabel(policy.instance_default_mode).toLowerCase()}) decides
+              who gets in. Save a list here, or Off, to opt out.
+            </AlertDescription>
+          </Alert>
+        )}
 
         {changedElsewhere && (
           <Alert>

@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# n8n as a single main instance (no queue workers or Redis); workflows,
+# credentials, executions and binary data live in a Temps-managed PostgreSQL
+# database.
+# Settings cross-checked against Coolify's n8n-with-postgres-and-worker.yaml template (https://github.com/coollabsio/coolify, Apache-2.0).
+slug: n8n
+name: n8n
+version: 1.0.0
+kind: app
+description: Visual workflow automation with code when you need it, backed by a Temps-managed PostgreSQL database.
+git:
+  url: https://github.com/n8n-io/n8n.git
+  ref: n8n@2.47.7
+preset: dockerfile
+image_url: /templates/n8n.png
+# Tag 2.47.7, multi-arch (linux/amd64, linux/arm64) index digest.
+image: n8nio/n8n@sha256:b4b90747b81fcda7e76550c0d3aa7f0f64917a1e9573cff40d6834eaf2e0f8ea
+resources:
+  cpu_request: 500000
+  cpu_limit: 1000000
+  memory_request: 512
+  memory_limit: 1536
+exposed_port: 5678
+health_check_path: /healthz/readiness
+tags:
+  - automation
+  - workflow
+  - integrations
+  - low-code
+features:
+  - Visual workflow editor with hundreds of integrations and JavaScript code nodes
+  - Workflows, credentials, executions and binary data stored in Temps-managed PostgreSQL
+  - Generated encryption key for stored credentials and webhook URLs on the public Temps address
+  - Single main instance; installed community nodes are reinstalled from npm on start
+services:
+  - postgres
+managed_service_bindings:
+  postgres:
+    DB_POSTGRESDB_HOST: POSTGRES_HOST
+    DB_POSTGRESDB_PORT: POSTGRES_PORT
+    DB_POSTGRESDB_DATABASE: POSTGRES_DB
+    DB_POSTGRESDB_USER: POSTGRES_USER
+    DB_POSTGRESDB_PASSWORD: POSTGRES_PASSWORD
+env_vars:
+  - name: DB_TYPE
+    description: n8n database engine
+    default: postgresdb
+    required: true
+  - name: N8N_ENCRYPTION_KEY
+    description: Key that encrypts stored credentials; keep it, or saved credentials become unreadable
+    required: true
+    secret: true
+    default_generator: random_secret
+  - name: N8N_EDITOR_BASE_URL
+    description: Public Temps URL of the editor, used in links and emails
+    required: true
+    default_generator: app_url
+  - name: N8N_WEBHOOK_URL
+    description: Public Temps URL used to build test and production webhook URLs
+    required: true
+    default_generator: app_url
+  - name: N8N_PROXY_HOPS
+    description: Number of reverse proxies in front of n8n (the Temps proxy)
+    default: "1"
+    required: true
+  - name: N8N_DEFAULT_BINARY_DATA_MODE
+    description: Keep execution binary data in PostgreSQL instead of the container disk
+    default: database
+    required: true
+  - name: N8N_REINSTALL_MISSING_PACKAGES
+    description: Reinstall community nodes recorded in the database when the container starts fresh
+    default: "true"
+    required: true
+  - name: GENERIC_TIMEZONE
+    description: Default timezone for schedule triggers (n8n otherwise uses America/New_York)
+    default: UTC
+    required: true
+is_public: true
+is_featured: false
+sort_order: 11

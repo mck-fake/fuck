@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Gotenberg is a stateless HTTP API around Chromium and LibreOffice. Basic
+# authentication is on so the public URL is not an open converter; /health
+# stays unauthenticated for probes.
+# Settings cross-checked against Coolify's gotenberg.yaml template (https://github.com/coollabsio/coolify, Apache-2.0).
+slug: gotenberg
+name: Gotenberg
+version: 1.0.0
+kind: app
+description: Stateless HTTP API that converts HTML, Markdown, URLs and Office documents to PDF, and merges, splits and transforms PDFs.
+git:
+  url: https://github.com/gotenberg/gotenberg.git
+  ref: v9.5.1
+preset: dockerfile
+image_url: /templates/gotenberg.png
+# Tag 9.5.1: multi-arch index (linux/amd64, linux/arm64, linux/arm/v7,
+# linux/386, linux/ppc64le).
+image: gotenberg/gotenberg@sha256:a0f596c2aeee6391c24ccf2953737971f13976b14d4240525a447f209185e2c8
+resources:
+  cpu_request: 500000
+  cpu_limit: 1000000
+  memory_request: 512
+  memory_limit: 1536
+exposed_port: 3000
+health_check_path: /health
+tags:
+  - pdf
+  - api
+  - document-conversion
+  - chromium
+  - libreoffice
+features:
+  - HTML, Markdown and URL to PDF with headless Chromium
+  - Word, Excel, PowerPoint and other office documents to PDF with LibreOffice
+  - Merge, split, PDF/A conversion and metadata through the same API
+  - Generated basic-auth credentials protect every conversion route
+services: []
+env_vars:
+  - name: API_ENABLE_BASIC_AUTH
+    description: Require HTTP basic authentication on every route except /health
+    default: "true"
+    required: true
+  - name: GOTENBERG_API_BASIC_AUTH_USERNAME
+    description: Username clients send with basic authentication
+    default: gotenberg
+    required: true
+  - name: GOTENBERG_API_BASIC_AUTH_PASSWORD
+    description: Password clients send with basic authentication
+    required: true
+    secret: true
+    default_generator: random_secret
+is_public: true
+is_featured: false
+sort_order: 19

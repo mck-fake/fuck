@@ -298,6 +298,9 @@ async fn register_builtin_plugins<R: PluginRegistrar>(
         // Deployment orchestration (depends on deployer, screenshots, and
         // vulnerability scanner).
         || Box::new(DeploymentsPlugin::new()),
+        // Deployment approvals: registers the DeploymentGate the deployments
+        // plugin reads in its second phase (depends on DeploymentService).
+        || Box::new(temps_approvals::ApprovalsPlugin::new()),
         // MCP server for AI tool integration (ADR-039). Depends on
         // ProjectsPlugin and DeploymentsPlugin (services registered above).
         // Routes are at root level (not under /api); assembled after plugin

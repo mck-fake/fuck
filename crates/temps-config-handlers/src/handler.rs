@@ -572,6 +572,14 @@ pub struct AppSettingsResponse {
     /// at password login (bherila/temps#32). SSO/OIDC logins are unaffected.
     pub require_mfa_for_admins: bool,
 
+    /// When enabled, sign-in is SSO only: password login and password resets
+    /// are refused for every account.
+    pub password_login_disabled: bool,
+
+    /// White-label console branding. Public by design (`GET /branding`
+    /// serves it before sign-in), so it holds nothing sensitive.
+    pub branding: temps_config::BrandingSettings,
+
     /// On-demand (lazy) HTTP-01 TLS issuance (ADR-018). No sensitive content,
     /// passed through as-is so operators can see whether on-demand
     /// certificates are enabled and for which zone.
@@ -1260,6 +1268,8 @@ impl From<AppSettings> for AppSettingsResponse {
             trusted_private_networks: settings.trusted_private_networks,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
+            password_login_disabled: settings.password_login_disabled,
+            branding: settings.branding,
             on_demand_tls: settings.on_demand_tls,
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
@@ -1396,10 +1406,13 @@ impl AppSettingsResponse {
         rotate_cluster_ca,
         refresh_route_table,
         get_public_ingress_status,
+        get_branding,
     ),
     components(schemas(
         AppSettings,
         AppSettingsResponse,
+        BrandingResponse,
+        temps_config::BrandingSettings,
         temps_config::disk_status::DiskInfo,
         temps_config::disk_status::DiskSpaceAlert,
         temps_config::disk_status::DiskSpaceCheckResult,
@@ -2349,6 +2362,62 @@ fn self_update_error_to_problem(error: temps_core::SelfUpdateError) -> Problem {
                 .to_string(),
         )
         .build()
+}
+
+/// The console's white-label branding, readable before sign-in so the login
+/// page can show it. Every field is `null` when unset (built-in look).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BrandingResponse {
+    pub product_name: Option<String>,
+    /// `#rrggbb`.
+    pub primary_color: Option<String>,
+    /// PNG, JPEG or WebP `data:` URI.
+    pub logo: Option<String>,
+    /// PNG, JPEG or WebP `data:` URI.
+    pub favicon: Option<String>,
+}
+
+impl From<temps_config::BrandingSettings> for BrandingResponse {
+    fn from(branding: temps_config::BrandingSettings) -> Self {
+        Self {
+            product_name: branding.product_name,
+            primary_color: branding.primary_color,
+            logo: branding.logo,
+            favicon: branding.favicon,
+        }
+    }
+}
+
+/// Get the console branding (public, no authentication)
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/branding",
+    responses(
+        (status = 200, description = "Console branding; null fields mean the built-in look", body = BrandingResponse),
+        (status = 500, description = "The settings could not be read")
+    )
+)]
+async fn get_branding(
+    State(config_service): State<Arc<ConfigService>>,
+) -> Result<Json<BrandingResponse>, Problem> {
+    let settings = config_service.get_settings().await.map_err(|e| {
+        error!(
+            "Failed to read settings for the public branding endpoint: {}",
+            e
+        );
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Branding Unavailable")
+            // Public route: the database error stays in the log above.
+            .detail("Could not read the console branding; the server log has the cause.")
+            .build()
+    })?;
+    Ok(Json(BrandingResponse::from(settings.branding)))
+}
+
+/// Routes served without authentication.
+pub fn configure_public_routes() -> Router<Arc<ConfigService>> {
+    Router::new().route("/branding", get(get_branding))
 }
 
 /// Get application settings
@@ -3460,6 +3529,18 @@ fn normalize_trusted_private_networks(networks: &mut Vec<String>) -> Result<(), 
     Ok(())
 }
 
+/// Validate the white-label branding and store it in canonical form.
+fn normalize_branding(
+    branding: temps_config::BrandingSettings,
+) -> Result<temps_config::BrandingSettings, Problem> {
+    branding.normalized().map_err(|error| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Branding")
+            .detail(format!("{error}. Nothing was saved."))
+            .build()
+    })
+}
+
 fn validate_otel_ingest_settings(otel: &temps_config::OtelIngestSettings) -> Result<(), Problem> {
     if otel.rate_limit_requests == 0 {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -3842,6 +3923,7 @@ async fn update_settings(
     validate_otel_ingest_settings(&settings.otel_ingest)?;
     validate_backup_executor_settings(&settings.backup_executor)?;
     normalize_trusted_private_networks(&mut settings.trusted_private_networks)?;
+    settings.branding = normalize_branding(std::mem::take(&mut settings.branding))?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;

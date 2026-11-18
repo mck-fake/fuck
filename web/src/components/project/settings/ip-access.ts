@@ -297,6 +297,27 @@ export function entriesToSave(
     .slice(0, MAX_CIDRS)
 }
 
+/**
+ * The status badge of a scope: what actually governs it. A scope with no
+ * list of its own follows its project's list (environments) or, when nothing
+ * above it has one, the instance default the server reports.
+ */
+export function scopeBadge(
+  policy: {
+    configured: boolean
+    mode: IpAccessMode
+    cidrs: readonly unknown[]
+    instance_default_mode?: IpAccessMode | null
+  },
+  isEnvironment: boolean
+): string {
+  if (!policy.configured && policy.instance_default_mode) {
+    return 'Follows the instance default'
+  }
+  if (isEnvironment && !policy.configured) return 'Follows the project list'
+  return policySummary(policy.mode, policy.cidrs.length)
+}
+
 /** One-line description of what the saved policy does, for status badges. */
 export function policySummary(mode: IpAccessMode, count: number): string {
   const noun = count === 1 ? 'range' : 'ranges'

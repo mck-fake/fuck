@@ -182,7 +182,7 @@ impl ResolvedAuthz {
 /// statement timeouts and permission-denied-on-table. Mapping that whole
 /// class to "already exists" tells an operator debugging an outage to go
 /// look for a duplicate row that does not exist.
-fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
+pub(crate) fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
     matches!(err, sea_orm::DbErr::RecordNotInserted)
         || err
             .sql_err()

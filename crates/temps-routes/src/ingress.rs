@@ -39,7 +39,7 @@ use temps_config::RateLimitSettings;
 use temps_entities::ingress_mode::{IngressMode, SandboxPreviewAccess};
 use temps_entities::{
     environments, ingress_access_policies, ingress_endpoints, ingress_login_grants,
-    project_ip_access_rules, projects, sandboxes, users,
+    instance_ip_access_default, project_ip_access_rules, projects, sandboxes, users,
 };
 use temps_workload_ingress::{
     AccessPolicy, CompiledEndpoint, CompiledRoutes, Endpoint, EndpointProtocol, EndpointTarget,
@@ -83,6 +83,9 @@ pub struct EnvironmentAccess<'a> {
     pub instance_rate_limiting: &'a RateLimitSettings,
     /// The `project_ip_access_rules` rows of the environment's project.
     pub ip_rules: &'a [project_ip_access_rules::Model],
+    /// The instance default, for an environment whose project has no row
+    /// of its own and no override for it.
+    pub instance_ip_default: Option<&'a instance_ip_access_default::Model>,
 }
 
 /// The environment's owner reference.
@@ -105,7 +108,8 @@ pub fn sandbox_owner(sandbox_id: i32) -> ProductRef {
 /// order it checks them:
 ///
 /// 1. the project IP gate (`project_ip_access_rules`, environment override
-///    first), failing closed for an unresolved client;
+///    first, then the project row, then the instance default), failing
+///    closed for an unresolved client;
 /// 2. the rate-limit blacklists (instance and project), which only ever see
 ///    a resolved client;
 /// 3. the per-client rate limit, with its whitelist exempt;
@@ -193,14 +197,22 @@ fn project_ip_policy(access: &EnvironmentAccess<'_>) -> Option<AccessPolicy> {
             Some(_) => {}
         }
     }
-    let row = environment_row.or(project_row)?;
-    let allow = match row.mode.as_str() {
+    // Same precedence as the proxy's gate: a row of its own (even a disabled
+    // one) wins over the instance default.
+    let (rule_id, mode, cidrs) = match environment_row.or(project_row) {
+        Some(row) => (Some(row.id), row.mode.as_str(), &row.cidrs.0),
+        None => {
+            let default = access.instance_ip_default?;
+            (None, default.mode.as_str(), &default.cidrs.0)
+        }
+    };
+    let allow = match mode {
         "disabled" => return None,
         "allow" => true,
         "deny" => false,
         other => {
             error!(
-                rule_id = row.id,
+                rule_id = ?rule_id,
                 project_id,
                 environment_id,
                 mode = other,
@@ -209,9 +221,9 @@ fn project_ip_policy(access: &EnvironmentAccess<'_>) -> Option<AccessPolicy> {
             return Some(deny_everyone());
         }
     };
-    let mut rules = Vec::with_capacity(row.cidrs.0.len());
+    let mut rules = Vec::with_capacity(cidrs.len());
     let mut unparsable = 0usize;
-    for entry in &row.cidrs.0 {
+    for entry in cidrs {
         match gate_entry(&entry.cidr) {
             Some(cidr) => rules.push(IpRule { cidr, allow }),
             None => unparsable += 1,
@@ -587,6 +599,11 @@ pub async fn load_ingress_snapshot(
         .all(db)
         .await
         .map_err(db_err("project IP access rules"))?;
+    let instance_ip_default =
+        instance_ip_access_default::Entity::find_by_id(instance_ip_access_default::SINGLETON_ID)
+            .one(db)
+            .await
+            .map_err(db_err("instance default IP access policy"))?;
     let mut rules_by_project: HashMap<i32, Vec<project_ip_access_rules::Model>> = HashMap::new();
     for row in ip_rules {
         rules_by_project
@@ -644,6 +661,7 @@ pub async fn load_ingress_snapshot(
             ip_rules: rules_by_project
                 .get(&environment.project_id)
                 .unwrap_or(&no_rules),
+            instance_ip_default: instance_ip_default.as_ref(),
         };
         if let Some(hash) = password_hash(environment) {
             passwords.insert(i64::from(environment.id), Box::<str>::from(hash));
@@ -867,6 +885,7 @@ mod tests {
             project,
             instance_rate_limiting: instance,
             ip_rules: rules,
+            instance_ip_default: None,
         })
     }
 
@@ -946,6 +965,47 @@ mod tests {
             }
         );
         assert_eq!(policies[3], AccessPolicy::Password { password_ref: 7 });
+    }
+
+    #[test]
+    fn the_instance_default_applies_only_without_a_row_of_its_own() {
+        let env = environment(7, 3);
+        let p = project(3);
+        let none = RateLimitSettings::default();
+        let now = chrono::Utc::now();
+        let default = instance_ip_access_default::Model {
+            id: 1,
+            mode: "allow".into(),
+            cidrs: IpAccessCidrs(vec![IpAccessCidrEntry {
+                cidr: "10.0.0.0/8".into(),
+                description: None,
+            }]),
+            updated_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let derive_with = |rules: &[project_ip_access_rules::Model]| {
+            derived_policies(&EnvironmentAccess {
+                environment: &env,
+                project: &p,
+                instance_rate_limiting: &none,
+                ip_rules: rules,
+                instance_ip_default: Some(&default),
+            })
+        };
+        let default_policy = AccessPolicy::IpRules {
+            rules: vec![IpRule {
+                cidr: "10.0.0.0/8".into(),
+                allow: true,
+            }],
+            unresolved: UnresolvedClient::Deny,
+        };
+        assert_eq!(derive_with(&[]), vec![default_policy]);
+        // A disabled project row opts the project out; so does an override.
+        assert!(derive_with(&[rule(3, None, "disabled", &[])]).is_empty());
+        assert!(derive_with(&[rule(3, Some(7), "disabled", &[])]).is_empty());
+        // Another environment's override does not exempt this one.
+        assert_eq!(derive_with(&[rule(3, Some(8), "disabled", &[])]).len(), 1);
     }
 
     #[test]
@@ -1045,6 +1105,7 @@ mod tests {
             project: &p,
             instance_rate_limiting: &none,
             ip_rules: &[],
+            instance_ip_default: None,
         };
         let good = environment_endpoint(1, &access, None, Vec::new());
         let mut other = environment(8, 3);

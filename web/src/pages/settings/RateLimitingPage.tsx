@@ -11,11 +11,12 @@ import {
 } from '@/components/settings/rate-limiting'
 import { isForbiddenRead } from '@/lib/read-failure'
 
+import { InstanceIpAccessDefaultCard } from '@/components/settings/InstanceIpAccessDefaultCard'
 import { IpAccessControl } from '@/components/settings/IpAccessControl'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
-import { Gauge, ListFilter } from 'lucide-react'
+import { Gauge, ListFilter, ShieldCheck } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -108,6 +109,16 @@ export function RateLimitingPage() {
         icon={ListFilter}
       >
         <IpAccessControl />
+      </SettingsSection>
+
+      {/* The instance default also saves through its own API. */}
+      <SettingsSection
+        id="ip-access-default"
+        title="Default IP list for projects"
+        description="Applies to every project and environment without an IP list of its own"
+        icon={ShieldCheck}
+      >
+        <InstanceIpAccessDefaultCard />
       </SettingsSection>
     </form>
   )

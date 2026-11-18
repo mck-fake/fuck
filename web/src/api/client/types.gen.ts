@@ -2128,6 +2128,12 @@ export type AppSettings = {
      */
     blob?: BlobSettings;
     /**
+     * White-label console branding (name, colour, logo, favicon). Empty by
+     * default, which keeps the built-in look. Served unauthenticated by
+     * `GET /branding`, so it must never hold anything secret.
+     */
+    branding?: BrandingSettings;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -2310,6 +2316,14 @@ export type AppSettings = {
      */
     otel_ingest?: OtelIngestSettings;
     /**
+     * When `true`, sign-in is SSO only: password login, password-reset
+     * requests and password-reset completion are refused for every account.
+     * OIDC sign-ins, API keys and deployment tokens are unaffected. Off by
+     * default so an upgrade never locks anyone out; `temps
+     * reset-admin-password` turns it back off as the break-glass path.
+     */
+    password_login_disabled?: boolean;
+    /**
      * Share verified external-plugin installation counts with the official
      * registry. Defaults to off; each plugin receives an unlinkable ID.
      */
@@ -2437,6 +2451,11 @@ export type AppSettingsResponse = {
      */
     backup_executor: BackupExecutorSettings;
     /**
+     * White-label console branding. Public by design (`GET /branding`
+     * serves it before sign-in), so it holds nothing sensitive.
+     */
+    branding: BrandingSettings;
+    /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.
      */
@@ -2553,6 +2572,11 @@ export type AppSettingsResponse = {
      * credentials are reported only as booleans.
      */
     otel_ingest: OtelIngestSettingsMasked;
+    /**
+     * When enabled, sign-in is SSO only: password login and password resets
+     * are refused for every account.
+     */
+    password_login_disabled: boolean;
     /**
      * Consent for verified external-plugin installation count reporting.
      */
@@ -2846,6 +2870,38 @@ export type ApplyServiceHealthcheckResponse = {
     service_id: number;
 };
 
+export type ApprovalDecision = 'approve' | 'reject';
+
+export type ApprovalListResponse = {
+    approvals: Array<ApprovalResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type ApprovalPolicyResponse = {
+    environment_id: number;
+    /**
+     * Every deployment to this environment waits for a person to approve it.
+     */
+    required: boolean;
+};
+
+export type ApprovalResponse = {
+    comment?: string | null;
+    created_at: string;
+    decided_at?: string | null;
+    decided_by?: number | null;
+    deployment_id: number;
+    environment_id: number;
+    id: number;
+    project_id: number;
+    /**
+     * `pending`, `approved` or `rejected`.
+     */
+    status: string;
+};
+
 export type ApproveSandboxService = {
     expected_version: number;
     /**
@@ -2966,9 +3022,20 @@ export type AssetCachePurgeResponse = {
     deleted: number;
 };
 
+export type AssignCustomRoleRequest = {
+    custom_role_id: number;
+};
+
 export type AssignRoleRequest = {
     role_type: string;
     user_id: number;
+};
+
+/**
+ * The permissions a custom role may carry.
+ */
+export type AssignablePermissionsResponse = {
+    permissions: Array<string>;
 };
 
 export type AttachEnvironmentVolumeRequest = {
@@ -3888,6 +3955,45 @@ export type BranchInfo = {
 
 export type BranchListResponse = {
     branches: Array<BranchInfo>;
+};
+
+/**
+ * The console's white-label branding, readable before sign-in so the login
+ * page can show it. Every field is `null` when unset (built-in look).
+ */
+export type BrandingResponse = {
+    /**
+     * PNG, JPEG or WebP `data:` URI.
+     */
+    favicon?: string | null;
+    /**
+     * PNG, JPEG or WebP `data:` URI.
+     */
+    logo?: string | null;
+    /**
+     * `#rrggbb`.
+     */
+    primary_color?: string | null;
+    product_name?: string | null;
+};
+
+export type BrandingSettings = {
+    /**
+     * `data:image/png|jpeg|webp;base64,...` used as the browser favicon.
+     */
+    favicon?: string | null;
+    /**
+     * `data:image/png|jpeg|webp;base64,...` shown as the console mark.
+     */
+    logo?: string | null;
+    /**
+     * Accent colour as `#rrggbb`; used for primary buttons and links.
+     */
+    primary_color?: string | null;
+    /**
+     * Replaces "Temps" in the console chrome and the browser tab title.
+     */
+    product_name?: string | null;
 };
 
 export type BrowserCount = {
@@ -9730,6 +9836,44 @@ export type CustomDomainResponse = {
     updated_at: number;
 };
 
+/**
+ * One membership's custom role, for showing it next to the fixed role.
+ */
+export type CustomRoleAssignment = {
+    custom_role_id: number;
+    custom_role_name: string;
+    team_member_id: number;
+    user_id: number;
+};
+
+export type CustomRoleListResponse = {
+    page: number;
+    page_size: number;
+    roles: Array<CustomRoleResponse>;
+    total: number;
+};
+
+/**
+ * Body of create and update: the whole role.
+ */
+export type CustomRoleRequest = {
+    description?: string | null;
+    name: string;
+    /**
+     * Permission strings, e.g. `deployments:create`. Must be project-scoped.
+     */
+    permissions: Array<string>;
+};
+
+export type CustomRoleResponse = {
+    created_at: string;
+    description?: string | null;
+    id: number;
+    name: string;
+    permissions: Array<string>;
+    updated_at: string;
+};
+
 export type CustomerMovementResponse = {
     bucket: string;
     churned_customers: number;
@@ -10080,6 +10224,14 @@ export type DatacenterDetectionStatus = {
     setup_path?: string | null;
 };
 
+export type DecideApprovalRequest = {
+    /**
+     * Optional note kept with the decision (at most 500 characters).
+     */
+    comment?: string | null;
+    decision: ApprovalDecision;
+};
+
 /**
  * `POST …/reachability/runs/{run_id}/decide`.
  */
@@ -10332,6 +10484,11 @@ export type DeployFromStaticRequest = {
      * Static bundle ID (required)
      */
     static_bundle_id: number;
+};
+
+export type DeploymentApprovalStatus = {
+    approval?: ApprovalResponse | null;
+    deployment_id: number;
 };
 
 /**
@@ -12845,6 +13002,60 @@ export type EdgeRuleResponse = {
     updated_at: string;
 };
 
+/**
+ * A page of a project's revisions, newest first.
+ */
+export type EdgeRuleRevisionListResponse = {
+    /**
+     * How many revisions are kept; older ones are pruned.
+     */
+    max_revisions: number;
+    page: number;
+    per_page: number;
+    project_id: number;
+    revisions: Array<EdgeRuleRevisionSummary>;
+    total: number;
+};
+
+/**
+ * A revision with its whole rule set, in evaluation order.
+ */
+export type EdgeRuleRevisionResponse = EdgeRuleRevisionSummary & {
+    project_id: number;
+    rules: Array<EdgeRuleRevisionRule>;
+};
+
+/**
+ * One rule as a revision stored it.
+ */
+export type EdgeRuleRevisionRule = {
+    action: EdgeRuleAction;
+    enabled: boolean;
+    environment_id?: number | null;
+    expression: EdgeRuleGroup;
+    id: number;
+    mode: EdgeRuleMode;
+    name: string;
+};
+
+/**
+ * One revision in the history list.
+ */
+export type EdgeRuleRevisionSummary = {
+    /**
+     * What the write did, e.g. "Created rule 'Block /admin'".
+     */
+    change: string;
+    created_at: string;
+    created_by?: number | null;
+    created_by_name?: string | null;
+    /**
+     * 1, 2, 3... per project; the highest is the rule set in force.
+     */
+    number: number;
+    rule_count: number;
+};
+
 export type EdgeRuleSampleHeader = {
     name: string;
     value: string;
@@ -13088,6 +13299,11 @@ export type EmailStatsResponse = {
 export type EmailStatusResponse = {
     email_configured: boolean;
     oidc_providers: Array<OidcProviderSummary>;
+    /**
+     * False when the instance is SSO only; the login page then hides the
+     * email and password form.
+     */
+    password_login_enabled: boolean;
     password_reset_available: boolean;
 };
 
@@ -18741,6 +18957,36 @@ export type InstallationReportingSettings = {
      * with the official Temps registry after a verified install succeeds.
      */
     enabled: boolean;
+};
+
+/**
+ * The instance default policy plus the caller's address, for "add my IP".
+ */
+export type InstanceIpAccessDefaultDetail = InstanceIpAccessDefaultResponse & {
+    your_ip?: string | null;
+};
+
+/**
+ * The instance default policy, applied to every project and environment
+ * without a policy of its own.
+ */
+export type InstanceIpAccessDefaultResponse = {
+    cidrs: Array<IpAccessCidrEntry>;
+    /**
+     * `false` when no default is stored: projects without a policy of their
+     * own are reachable from any address.
+     */
+    configured: boolean;
+    /**
+     * Maximum number of CIDRs a policy may hold.
+     */
+    max_cidrs: number;
+    mode: IpAccessMode;
+    updated_at?: string | null;
+    /**
+     * Things the operator should know about the saved policy.
+     */
+    warnings?: Array<string>;
 };
 
 /**
@@ -24903,7 +25149,7 @@ export type PluginStatusResponse = {
 /**
  * Which policy decided a test.
  */
-export type PolicySource = 'draft' | 'environment' | 'project' | 'none';
+export type PolicySource = 'draft' | 'environment' | 'project' | 'instance' | 'none';
 
 /**
  * Port mapping
@@ -25759,6 +26005,7 @@ export type ProjectIpAccessResponse = {
      * `null` for the project-wide policy.
      */
     environment_id?: number | null;
+    instance_default_mode?: IpAccessMode | null;
     /**
      * Maximum number of CIDRs a policy may hold.
      */
@@ -32155,6 +32402,10 @@ export type SetAlternateSourcesRequest = {
      * project to its configured source again.
      */
     allow_alternate_sources: boolean;
+};
+
+export type SetApprovalPolicyRequest = {
+    required: boolean;
 };
 
 /**
@@ -39341,6 +39592,12 @@ export type AppSettingsWritable = {
      */
     blob?: BlobSettings;
     /**
+     * White-label console branding (name, colour, logo, favicon). Empty by
+     * default, which keeps the built-in look. Served unauthenticated by
+     * `GET /branding`, so it must never hold anything secret.
+     */
+    branding?: BrandingSettings;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -39522,6 +39779,14 @@ export type AppSettingsWritable = {
      * `TEMPS_OTEL_*` environment variables; applied at the next restart.
      */
     otel_ingest?: OtelIngestSettingsWritable;
+    /**
+     * When `true`, sign-in is SSO only: password login, password-reset
+     * requests and password-reset completion are refused for every account.
+     * OIDC sign-ins, API keys and deployment tokens are unaffected. Off by
+     * default so an upgrade never locks anyone out; `temps
+     * reset-admin-password` turns it back off as the break-glass path.
+     */
+    password_login_disabled?: boolean;
     /**
      * Share verified external-plugin installation counts with the official
      * registry. Defaults to off; each plugin receives an unlinkable ID.
@@ -48633,6 +48898,10 @@ export type LoginErrors = {
      */
     401: unknown;
     /**
+     * Password sign-in is disabled; the instance is SSO only
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -48760,6 +49029,10 @@ export type RequestPasswordResetData = {
 
 export type RequestPasswordResetErrors = {
     /**
+     * Password sign-in is disabled; the instance is SSO only
+     */
+    403: unknown;
+    /**
      * Email service not configured
      */
     503: unknown;
@@ -48786,6 +49059,10 @@ export type ResetPasswordErrors = {
      * Invalid or expired token
      */
     400: unknown;
+    /**
+     * Password sign-in is disabled; the instance is SSO only
+     */
+    403: unknown;
     /**
      * Internal server error
      */
@@ -50806,6 +51083,29 @@ export type BlobHeadResponses = {
     200: unknown;
 };
 
+export type GetBrandingData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/branding';
+};
+
+export type GetBrandingErrors = {
+    /**
+     * The settings could not be read
+     */
+    500: unknown;
+};
+
+export type GetBrandingResponses = {
+    /**
+     * Console branding; null fields mean the built-in look
+     */
+    200: BrandingResponse;
+};
+
+export type GetBrandingResponse = GetBrandingResponses[keyof GetBrandingResponses];
+
 export type DisconnectCloudData = {
     body?: never;
     path?: never;
@@ -51335,6 +51635,215 @@ export type DnsTrafficResponses = {
 };
 
 export type DnsTrafficResponse2 = DnsTrafficResponses[keyof DnsTrafficResponses];
+
+export type ListCustomRolesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * 1-indexed page
+         */
+        page?: number;
+        /**
+         * default 20, max 100
+         */
+        page_size?: number;
+    };
+    url: '/custom-roles';
+};
+
+export type ListCustomRolesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListCustomRolesResponses = {
+    /**
+     * Paginated custom roles, newest first
+     */
+    200: CustomRoleListResponse;
+};
+
+export type ListCustomRolesResponse = ListCustomRolesResponses[keyof ListCustomRolesResponses];
+
+export type CreateCustomRoleData = {
+    body: CustomRoleRequest;
+    path?: never;
+    query?: never;
+    url: '/custom-roles';
+};
+
+export type CreateCustomRoleErrors = {
+    /**
+     * Invalid name or permissions
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Name already taken
+     */
+    409: unknown;
+};
+
+export type CreateCustomRoleResponses = {
+    /**
+     * Custom role created
+     */
+    201: CustomRoleResponse;
+};
+
+export type CreateCustomRoleResponse = CreateCustomRoleResponses[keyof CreateCustomRoleResponses];
+
+export type ListAssignablePermissionsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/custom-roles/permissions';
+};
+
+export type ListAssignablePermissionsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListAssignablePermissionsResponses = {
+    /**
+     * Permissions a custom role may carry
+     */
+    200: AssignablePermissionsResponse;
+};
+
+export type ListAssignablePermissionsResponse = ListAssignablePermissionsResponses[keyof ListAssignablePermissionsResponses];
+
+export type DeleteCustomRoleData = {
+    body?: never;
+    path: {
+        role_id: number;
+    };
+    query?: never;
+    url: '/custom-roles/{role_id}';
+};
+
+export type DeleteCustomRoleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Custom role not found
+     */
+    404: unknown;
+    /**
+     * Role still assigned to team members
+     */
+    409: unknown;
+};
+
+export type DeleteCustomRoleResponses = {
+    /**
+     * Custom role deleted
+     */
+    204: void;
+};
+
+export type DeleteCustomRoleResponse = DeleteCustomRoleResponses[keyof DeleteCustomRoleResponses];
+
+export type GetCustomRoleData = {
+    body?: never;
+    path: {
+        role_id: number;
+    };
+    query?: never;
+    url: '/custom-roles/{role_id}';
+};
+
+export type GetCustomRoleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Custom role not found
+     */
+    404: unknown;
+};
+
+export type GetCustomRoleResponses = {
+    /**
+     * The custom role
+     */
+    200: CustomRoleResponse;
+};
+
+export type GetCustomRoleResponse = GetCustomRoleResponses[keyof GetCustomRoleResponses];
+
+export type UpdateCustomRoleData = {
+    body: CustomRoleRequest;
+    path: {
+        role_id: number;
+    };
+    query?: never;
+    url: '/custom-roles/{role_id}';
+};
+
+export type UpdateCustomRoleErrors = {
+    /**
+     * Invalid name or permissions
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Custom role not found
+     */
+    404: unknown;
+    /**
+     * Name already taken
+     */
+    409: unknown;
+};
+
+export type UpdateCustomRoleResponses = {
+    /**
+     * Custom role replaced
+     */
+    200: CustomRoleResponse;
+};
+
+export type UpdateCustomRoleResponse = UpdateCustomRoleResponses[keyof UpdateCustomRoleResponses];
 
 export type GetDashboardProjectsAnalyticsData = {
     body?: never;
@@ -63693,6 +64202,117 @@ export type UpdateIpAccessControlResponses = {
 
 export type UpdateIpAccessControlResponse = UpdateIpAccessControlResponses[keyof UpdateIpAccessControlResponses];
 
+export type DeleteInstanceIpAccessDefaultData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ip-access/default';
+};
+
+export type DeleteInstanceIpAccessDefaultErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No default is stored
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteInstanceIpAccessDefaultError = DeleteInstanceIpAccessDefaultErrors[keyof DeleteInstanceIpAccessDefaultErrors];
+
+export type DeleteInstanceIpAccessDefaultResponses = {
+    /**
+     * Default removed
+     */
+    204: void;
+};
+
+export type DeleteInstanceIpAccessDefaultResponse = DeleteInstanceIpAccessDefaultResponses[keyof DeleteInstanceIpAccessDefaultResponses];
+
+export type GetInstanceIpAccessDefaultData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ip-access/default';
+};
+
+export type GetInstanceIpAccessDefaultErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetInstanceIpAccessDefaultError = GetInstanceIpAccessDefaultErrors[keyof GetInstanceIpAccessDefaultErrors];
+
+export type GetInstanceIpAccessDefaultResponses = {
+    /**
+     * The instance default policy
+     */
+    200: InstanceIpAccessDefaultDetail;
+};
+
+export type GetInstanceIpAccessDefaultResponse = GetInstanceIpAccessDefaultResponses[keyof GetInstanceIpAccessDefaultResponses];
+
+export type PutInstanceIpAccessDefaultData = {
+    body: SetProjectIpAccessRequest;
+    path?: never;
+    query?: never;
+    url: '/ip-access/default';
+};
+
+export type PutInstanceIpAccessDefaultErrors = {
+    /**
+     * Invalid policy
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Policy would lock out the caller
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type PutInstanceIpAccessDefaultError = PutInstanceIpAccessDefaultErrors[keyof PutInstanceIpAccessDefaultErrors];
+
+export type PutInstanceIpAccessDefaultResponses = {
+    /**
+     * Default saved
+     */
+    200: InstanceIpAccessDefaultDetail;
+};
+
+export type PutInstanceIpAccessDefaultResponse = PutInstanceIpAccessDefaultResponses[keyof PutInstanceIpAccessDefaultResponses];
+
 export type KvDelData = {
     body: DelRequest;
     path?: never;
@@ -75300,6 +75920,53 @@ export type GetApiTimeseriesResponses = {
 
 export type GetApiTimeseriesResponse = GetApiTimeseriesResponses[keyof GetApiTimeseriesResponses];
 
+export type ListApprovalsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * `pending`, `approved` or `rejected`; all when omitted.
+         */
+        status?: string | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/approvals';
+};
+
+export type ListApprovalsErrors = {
+    /**
+     * Unknown status filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListApprovalsResponses = {
+    /**
+     * Approval requests
+     */
+    200: ApprovalListResponse;
+};
+
+export type ListApprovalsResponse = ListApprovalsResponses[keyof ListApprovalsResponses];
+
 export type PurgeAssetCacheData = {
     body?: never;
     path: {
@@ -77148,6 +77815,106 @@ export type GetDeploymentResponses = {
 
 export type GetDeploymentResponse = GetDeploymentResponses[keyof GetDeploymentResponses];
 
+export type GetDeploymentApprovalData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/approval';
+};
+
+export type GetDeploymentApprovalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Deployment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentApprovalResponses = {
+    /**
+     * The request, or null when none was needed
+     */
+    200: DeploymentApprovalStatus;
+};
+
+export type GetDeploymentApprovalResponse = GetDeploymentApprovalResponses[keyof GetDeploymentApprovalResponses];
+
+export type DecideDeploymentApprovalData = {
+    body: DecideApprovalRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/approval';
+};
+
+export type DecideDeploymentApprovalErrors = {
+    /**
+     * Invalid comment
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No approval request for this deployment
+     */
+    404: unknown;
+    /**
+     * Already decided
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The approved deployment could not be queued; it stays pending
+     */
+    503: unknown;
+};
+
+export type DecideDeploymentApprovalResponses = {
+    /**
+     * ApprovalDecision recorded
+     */
+    200: ApprovalResponse;
+};
+
+export type DecideDeploymentApprovalResponse = DecideDeploymentApprovalResponses[keyof DecideDeploymentApprovalResponses];
+
 export type CancelDeploymentData = {
     body?: never;
     path: {
@@ -78447,6 +79214,155 @@ export type ReorderEdgeRulesResponses = {
 
 export type ReorderEdgeRulesResponse = ReorderEdgeRulesResponses[keyof ReorderEdgeRulesResponses];
 
+export type ListEdgeRuleRevisionsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        page?: number;
+        per_page?: number;
+    };
+    url: '/projects/{project_id}/edge-rules/revisions';
+};
+
+export type ListEdgeRuleRevisionsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListEdgeRuleRevisionsError = ListEdgeRuleRevisionsErrors[keyof ListEdgeRuleRevisionsErrors];
+
+export type ListEdgeRuleRevisionsResponses = {
+    /**
+     * A page of revisions, newest first
+     */
+    200: EdgeRuleRevisionListResponse;
+};
+
+export type ListEdgeRuleRevisionsResponse = ListEdgeRuleRevisionsResponses[keyof ListEdgeRuleRevisionsResponses];
+
+export type GetEdgeRuleRevisionData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Revision number
+         */
+        number: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules/revisions/{number}';
+};
+
+export type GetEdgeRuleRevisionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or revision not found
+     */
+    404: ProblemDetails;
+    /**
+     * The revision is stored in a form this version cannot read
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetEdgeRuleRevisionError = GetEdgeRuleRevisionErrors[keyof GetEdgeRuleRevisionErrors];
+
+export type GetEdgeRuleRevisionResponses = {
+    /**
+     * The revision with its whole rule set
+     */
+    200: EdgeRuleRevisionResponse;
+};
+
+export type GetEdgeRuleRevisionResponse = GetEdgeRuleRevisionResponses[keyof GetEdgeRuleRevisionResponses];
+
+export type RestoreEdgeRuleRevisionData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Revision number
+         */
+        number: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/edge-rules/revisions/{number}/restore';
+};
+
+export type RestoreEdgeRuleRevisionErrors = {
+    /**
+     * A rule of the revision is no longer valid
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, revision or an environment it names not found
+     */
+    404: ProblemDetails;
+    /**
+     * The revision cannot be restored
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RestoreEdgeRuleRevisionError = RestoreEdgeRuleRevisionErrors[keyof RestoreEdgeRuleRevisionErrors];
+
+export type RestoreEdgeRuleRevisionResponses = {
+    /**
+     * The rules now in force
+     */
+    200: EdgeRuleListResponse;
+};
+
+export type RestoreEdgeRuleRevisionResponse = RestoreEdgeRuleRevisionResponses[keyof RestoreEdgeRuleRevisionResponses];
+
 export type DeleteEdgeRuleData = {
     body?: never;
     path: {
@@ -79722,6 +80638,94 @@ export type WakeEnvironmentResponses = {
 };
 
 export type WakeEnvironmentResponse = WakeEnvironmentResponses[keyof WakeEnvironmentResponses];
+
+export type GetApprovalPolicyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/approval-policy';
+};
+
+export type GetApprovalPolicyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetApprovalPolicyResponses = {
+    /**
+     * The environment's policy
+     */
+    200: ApprovalPolicyResponse;
+};
+
+export type GetApprovalPolicyResponse = GetApprovalPolicyResponses[keyof GetApprovalPolicyResponses];
+
+export type SetApprovalPolicyData = {
+    body: SetApprovalPolicyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/approval-policy';
+};
+
+export type SetApprovalPolicyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetApprovalPolicyResponses = {
+    /**
+     * Policy saved
+     */
+    200: ApprovalPolicyResponse;
+};
+
+export type SetApprovalPolicyResponse = SetApprovalPolicyResponses[keyof SetApprovalPolicyResponses];
 
 export type PurgeEnvironmentAssetCacheData = {
     body?: never;
@@ -93539,6 +94543,35 @@ export type UpdateTeamResponses = {
 
 export type UpdateTeamResponse = UpdateTeamResponses[keyof UpdateTeamResponses];
 
+export type ListTeamCustomRolesData = {
+    body?: never;
+    path: {
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/custom-roles';
+};
+
+export type ListTeamCustomRolesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListTeamCustomRolesResponses = {
+    /**
+     * Custom roles held by this team's members
+     */
+    200: Array<CustomRoleAssignment>;
+};
+
+export type ListTeamCustomRolesResponse = ListTeamCustomRolesResponses[keyof ListTeamCustomRolesResponses];
+
 export type ListTeamMembersData = {
     body?: never;
     path: {
@@ -93660,6 +94693,74 @@ export type UpdateTeamMemberRoleResponses = {
 };
 
 export type UpdateTeamMemberRoleResponse = UpdateTeamMemberRoleResponses[keyof UpdateTeamMemberRoleResponses];
+
+export type UnassignCustomRoleData = {
+    body?: never;
+    path: {
+        team_id: number;
+        user_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members/{user_id}/custom-role';
+};
+
+export type UnassignCustomRoleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Member not found or holds no custom role
+     */
+    404: unknown;
+};
+
+export type UnassignCustomRoleResponses = {
+    /**
+     * The member is back on their fixed role
+     */
+    204: void;
+};
+
+export type UnassignCustomRoleResponse = UnassignCustomRoleResponses[keyof UnassignCustomRoleResponses];
+
+export type AssignCustomRoleData = {
+    body: AssignCustomRoleRequest;
+    path: {
+        team_id: number;
+        user_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members/{user_id}/custom-role';
+};
+
+export type AssignCustomRoleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Member or custom role not found
+     */
+    404: unknown;
+};
+
+export type AssignCustomRoleResponses = {
+    /**
+     * The member now holds this custom role
+     */
+    200: CustomRoleAssignment;
+};
+
+export type AssignCustomRoleResponse = AssignCustomRoleResponses[keyof AssignCustomRoleResponses];
 
 export type ListTeamProjectsData = {
     body?: never;

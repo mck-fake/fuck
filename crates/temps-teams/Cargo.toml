@@ -28,6 +28,7 @@ utoipa = { workspace = true, features = ["chrono"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tower = { workspace = true }
 
 [lints]
 workspace = true

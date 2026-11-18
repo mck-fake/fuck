@@ -10,9 +10,11 @@
 //! enforced by `project_access_guard!`/`project_permission_guard!` in the
 //! project-scoped handlers across the rest of the platform.
 
+mod custom_roles;
 mod project_access;
 mod teams;
 
+pub use custom_roles::*;
 pub use project_access::*;
 pub use teams::*;
 
@@ -43,6 +45,8 @@ pub struct TeamsAppState {
     /// team) — challenges with MFA step-up when the acting user has one
     /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    /// Custom roles and their assignment to memberships.
+    pub custom_roles: Arc<crate::custom_roles::CustomRoleService>,
 }
 
 impl TeamsAppState {
@@ -51,12 +55,14 @@ impl TeamsAppState {
         audit: Arc<dyn AuditLogger>,
         checker: Arc<TeamProjectAccessChecker>,
         sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+        custom_roles: Arc<crate::custom_roles::CustomRoleService>,
     ) -> Self {
         Self {
             team_service,
             audit,
             checker,
             sensitive_action_authorizer,
+            custom_roles,
         }
     }
 }
@@ -65,6 +71,7 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
     Router::new()
         .merge(teams::router())
         .merge(project_access::router())
+        .merge(custom_roles::router())
         .with_state(state)
 }
 
@@ -84,6 +91,15 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
         project_access::list_project_access,
         project_access::grant_project_access,
         project_access::revoke_project_access,
+        custom_roles::list_custom_roles,
+        custom_roles::list_assignable_permissions,
+        custom_roles::get_custom_role,
+        custom_roles::create_custom_role,
+        custom_roles::update_custom_role,
+        custom_roles::delete_custom_role,
+        custom_roles::list_team_custom_roles,
+        custom_roles::assign_custom_role,
+        custom_roles::unassign_custom_role,
     ),
     components(schemas(
         teams::TeamResponse,
@@ -96,6 +112,12 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
         CreateProjectAccessRequest,
         UpdateMemberRoleRequest,
         temps_entities::TeamRole,
+        custom_roles::CustomRoleResponse,
+        custom_roles::CustomRoleListResponse,
+        custom_roles::AssignablePermissionsResponse,
+        crate::custom_roles::CustomRoleRequest,
+        crate::custom_roles::AssignCustomRoleRequest,
+        crate::custom_roles::CustomRoleAssignment,
     )),
     tags((name = "Teams", description = "Teams and project-scoped access"))
 )]

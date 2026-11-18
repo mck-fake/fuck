@@ -16,6 +16,7 @@ import {
 import { cn } from '@/lib/utils'
 import { ButtonProps } from '@/components/ui/button'
 import { writeToClipboard } from '@/lib/clipboard'
+import { useI18n } from '@/components/providers/I18nProvider'
 
 interface CopyButtonProps extends ButtonProps {
   value: string
@@ -42,9 +43,11 @@ export function CopyButton({
   className,
   children,
   minimal = false,
-  label = 'Copy to clipboard',
+  label: labelProp,
   ...props
 }: CopyButtonProps) {
+  const { t } = useI18n()
+  const label = labelProp ?? t.common.copyToClipboard
   const [state, setState] = React.useState<'idle' | 'copied' | 'failed'>('idle')
 
   React.useEffect(() => {
@@ -61,11 +64,9 @@ export function CopyButton({
       // Both the icon and a toast: the icon alone is easy to miss, and the
       // reason (almost always an insecure origin) is not guessable.
       setState('failed')
-      toast.error("Couldn't copy to clipboard", {
+      toast.error(t.common.copyFailedTitle, {
         description:
-          e instanceof Error && e.message
-            ? e.message
-            : 'Your browser blocked the copy. Select the text and copy it manually.',
+          e instanceof Error && e.message ? e.message : t.common.copyBlocked,
       })
     }
   }
@@ -102,9 +103,9 @@ export function CopyButton({
         <TooltipContent>
           <p>
             {state === 'copied'
-              ? 'Copied'
+              ? t.common.copied
               : state === 'failed'
-                ? 'Copy failed'
+                ? t.common.copyFailed
                 : label}
           </p>
         </TooltipContent>

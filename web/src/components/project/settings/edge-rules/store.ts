@@ -8,8 +8,11 @@
 import {
   createEdgeRule,
   deleteEdgeRule,
+  getEdgeRuleRevision,
+  listEdgeRuleRevisions,
   listEdgeRules,
   reorderEdgeRules,
+  restoreEdgeRuleRevision,
   updateEdgeRule,
 } from '@/api/client'
 import {
@@ -18,6 +21,7 @@ import {
   useQueryClient,
 } from '@tanstack/react-query'
 import { draftToApi, ruleFromApi, type ApiRule } from './api'
+import { revisionRuleFromApi, type ApiRevisionRule } from './history'
 import type { EdgeRule, EdgeRuleDraft } from './types'
 
 /** The generated client types `expression`/`action` loosely; `api.ts` owns
@@ -192,5 +196,62 @@ export function useMoveEdgeRule(projectId: number) {
         queryKey: edgeRulesQueryKey(projectId),
       })
     },
+  })
+}
+
+// ---- version history (ADR-089 A1) ----------------------------------------
+
+export const edgeRuleRevisionsQueryKey = (projectId: number) =>
+  ['edge-rules', projectId, 'revisions'] as const
+
+export const edgeRuleRevisionsOptions = (
+  projectId: number,
+  page: number,
+  perPage: number
+) =>
+  queryOptions({
+    queryKey: [...edgeRuleRevisionsQueryKey(projectId), page, perPage],
+    queryFn: async () => {
+      const { data } = await listEdgeRuleRevisions({
+        path: { project_id: projectId },
+        query: { page, per_page: perPage },
+        throwOnError: true,
+      })
+      return data
+    },
+  })
+
+export const edgeRuleRevisionOptions = (projectId: number, number: number) =>
+  queryOptions({
+    queryKey: [...edgeRuleRevisionsQueryKey(projectId), 'detail', number],
+    queryFn: async () => {
+      const { data } = await getEdgeRuleRevision({
+        path: { project_id: projectId, number },
+        throwOnError: true,
+      })
+      return {
+        ...data,
+        rules: data.rules.map((rule) =>
+          revisionRuleFromApi(rule as unknown as ApiRevisionRule)
+        ),
+      }
+    },
+  })
+
+/** Puts the rules back as they were in a revision; recorded as a new one. */
+export function useRestoreEdgeRuleRevision(projectId: number) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (number: number) => {
+      const { data } = await restoreEdgeRuleRevision({
+        path: { project_id: projectId, number },
+        throwOnError: true,
+      })
+      return data.rules.map(fromApi)
+    },
+    meta: { errorTitle: 'Failed to restore edge rules' },
+    onSettled: () =>
+      // The prefix covers the rule list and its revisions.
+      queryClient.invalidateQueries({ queryKey: edgeRulesQueryKey(projectId) }),
   })
 }

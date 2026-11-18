@@ -27,6 +27,7 @@ import { EnvironmentVolumesCard } from './EnvironmentVolumesCard'
 import { PurgeAssetCacheCard } from './PurgeAssetCacheCard'
 import { InternalAccessCard } from '../InternalAccessCard'
 import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
+import { ApprovalPolicyCard } from '@/components/approvals/ApprovalPolicyCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 interface EnvironmentDetailProps {
@@ -275,6 +276,12 @@ export function EnvironmentDetail({
         onUpdate={() => {
           queryClient.invalidateQueries({ queryKey: ['environment'] })
         }}
+      />
+
+      <ApprovalPolicyCard
+        key={`approvals:${environment.id}`}
+        projectId={project.id}
+        environmentId={environment.id}
       />
 
       <ProjectIpAccessCard

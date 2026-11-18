@@ -18,6 +18,7 @@ import {
   KeyRound,
   LockKeyhole,
   Network,
+  Palette,
   RadioTower,
   Server,
   Settings2,
@@ -74,6 +75,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
       },
       { title: 'Temps Cloud', url: '/settings/cloud', icon: Cloud },
       {
+        title: 'Branding',
+        url: '/settings/branding',
+        icon: Palette,
+        keywords: ['white label', 'logo', 'favicon', 'colour', 'color', 'name'],
+      },
+      {
         title: 'Telemetry',
         url: '/settings/telemetry',
         icon: RadioTower,
@@ -89,6 +96,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         title: 'Teams',
         url: '/settings/teams',
         icon: UsersRound,
+        featureKey: 'teams',
+      },
+      {
+        title: 'Roles',
+        url: '/settings/roles',
+        icon: ShieldCheck,
         featureKey: 'teams',
       },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },

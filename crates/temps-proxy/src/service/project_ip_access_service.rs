@@ -10,12 +10,15 @@
 //! Scope model: `environment_id = None` is the project-wide policy; a row with
 //! an environment id overrides it for that environment alone (replace, not
 //! merge). Deleting an environment row returns it to inheriting the project.
+//! A scope with no row of its own falls back to the instance default
+//! (`instance_ip_access_default`), which this service also manages.
 
 use crate::ip_access::{
     parse_cidr, CidrError, CidrSet, IpAccessMode, MAX_CIDRS_PER_POLICY, MAX_DESCRIPTION_LEN,
 };
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
     TransactionTrait,
@@ -26,7 +29,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use temps_core::ways_in::{private_allow_list_message, AddressWayIn, EnvironmentWaysIn};
 use temps_entities::project_ip_access_rules::{self, IpAccessCidrEntry, IpAccessCidrs};
-use temps_entities::{environments, projects};
+use temps_entities::{environments, instance_ip_access_default, projects};
 use thiserror::Error;
 use utoipa::ToSchema;
 
@@ -192,6 +195,11 @@ pub struct ProjectIpAccessResponse {
     /// not being able to tell how visitors arrive (ADR 064 D9).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Set when neither this scope nor (for an environment) its project has a
+    /// policy of its own and the instance default enforces this mode on it.
+    /// Saving `disabled` here exempts the scope from the default.
+    #[serde(default)]
+    pub instance_default_mode: Option<IpAccessMode>,
 }
 
 impl ProjectIpAccessResponse {
@@ -205,6 +213,7 @@ impl ProjectIpAccessResponse {
             max_cidrs: MAX_CIDRS_PER_POLICY,
             updated_at: None,
             warnings: Vec::new(),
+            instance_default_mode: None,
         }
     }
 }
@@ -222,6 +231,7 @@ impl From<project_ip_access_rules::Model> for ProjectIpAccessResponse {
             max_cidrs: MAX_CIDRS_PER_POLICY,
             updated_at: Some(model.updated_at),
             warnings: Vec::new(),
+            instance_default_mode: None,
         }
     }
 }
@@ -248,8 +258,56 @@ pub enum PolicySource {
     Environment,
     /// The project-wide policy (inherited by the environment).
     Project,
+    /// The instance default: the project has no policy of its own.
+    Instance,
     /// No policy applies: everything is allowed.
     None,
+}
+
+/// Scope label of the instance default in errors and logs.
+const INSTANCE_DEFAULT_SCOPE: &str = "the instance default";
+
+/// The instance default policy, applied to every project and environment
+/// without a policy of its own.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InstanceIpAccessDefaultResponse {
+    /// `false` when no default is stored: projects without a policy of their
+    /// own are reachable from any address.
+    pub configured: bool,
+    pub mode: IpAccessMode,
+    pub cidrs: Vec<IpAccessCidrEntry>,
+    /// Maximum number of CIDRs a policy may hold.
+    pub max_cidrs: usize,
+    #[schema(value_type = Option<String>, format = "date-time", example = "2026-11-17T09:30:00Z")]
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Things the operator should know about the saved policy.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+impl From<Option<instance_ip_access_default::Model>> for InstanceIpAccessDefaultResponse {
+    fn from(model: Option<instance_ip_access_default::Model>) -> Self {
+        match model {
+            Some(model) => Self {
+                configured: true,
+                // As for project rules: an unknown mode reads as the most
+                // restrictive one, never as open.
+                mode: IpAccessMode::parse(&model.mode).unwrap_or(IpAccessMode::Allow),
+                cidrs: model.cidrs.0,
+                max_cidrs: MAX_CIDRS_PER_POLICY,
+                updated_at: Some(model.updated_at),
+                warnings: Vec::new(),
+            },
+            None => Self {
+                configured: false,
+                mode: IpAccessMode::Disabled,
+                cidrs: Vec::new(),
+                max_cidrs: MAX_CIDRS_PER_POLICY,
+                updated_at: None,
+                warnings: Vec::new(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -377,6 +435,40 @@ fn aligned_policy(stored: Vec<IpAccessCidrEntry>) -> (Vec<IpAccessCidrEntry>, Ve
         .into_iter()
         .filter_map(|entry| parse_cidr(&entry.cidr).ok().map(|network| (entry, network)))
         .unzip()
+}
+
+/// Refuse a policy that would lock out the address the save came from,
+/// unless the operator acknowledged it.
+fn check_lockout(
+    scope: &str,
+    policy: &ValidatedPolicy,
+    caller_ip: Option<IpAddr>,
+    acknowledge_lockout: bool,
+) -> Result<(), ProjectIpAccessError> {
+    let Some(caller_ip) = caller_ip.filter(|_| !acknowledge_lockout) else {
+        return Ok(());
+    };
+    let effect = match policy.mode {
+        IpAccessMode::Allow
+            if !evaluate_with_set(IpAccessMode::Allow, &policy.networks, caller_ip) =>
+        {
+            Some("exclude")
+        }
+        IpAccessMode::Deny
+            if !evaluate_with_set(IpAccessMode::Deny, &policy.networks, caller_ip) =>
+        {
+            Some("block")
+        }
+        _ => None,
+    };
+    match effect {
+        Some(effect) => Err(ProjectIpAccessError::WouldLockOutCaller {
+            scope: scope.to_string(),
+            caller_ip: normalize_ip(caller_ip).to_string(),
+            effect,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The verdict through the production matcher, so the test endpoint cannot
@@ -545,10 +637,23 @@ impl ProjectIpAccessService {
         environment_id: Option<i32>,
     ) -> Result<ProjectIpAccessResponse, ProjectIpAccessError> {
         self.ensure_scope_exists(project_id, environment_id).await?;
-        Ok(match self.find_row(project_id, environment_id).await? {
-            Some(row) => ProjectIpAccessResponse::from(row),
-            None => ProjectIpAccessResponse::unconfigured(project_id, environment_id),
-        })
+        let Some(row) = self.find_row(project_id, environment_id).await? else {
+            let mut response = ProjectIpAccessResponse::unconfigured(project_id, environment_id);
+            // An environment without a row follows its project's row first.
+            let project_has_row = match environment_id {
+                Some(_) => self.find_row(project_id, None).await?.is_some(),
+                None => false,
+            };
+            if !project_has_row {
+                response.instance_default_mode = self
+                    .find_default()
+                    .await?
+                    .and_then(|default| IpAccessMode::parse(&default.mode))
+                    .filter(|mode| *mode != IpAccessMode::Disabled);
+            }
+            return Ok(response);
+        };
+        Ok(ProjectIpAccessResponse::from(row))
     }
 
     /// Validate and store the complete policy for one scope.
@@ -566,31 +671,7 @@ impl ProjectIpAccessService {
     ) -> Result<ProjectIpAccessResponse, ProjectIpAccessError> {
         let scope = scope_label(project_id, environment_id);
         let policy = validate_policy(&scope, request.mode, &request.cidrs)?;
-
-        if !request.acknowledge_lockout {
-            if let Some(caller_ip) = caller_ip {
-                let effect = match policy.mode {
-                    IpAccessMode::Allow
-                        if !evaluate_with_set(IpAccessMode::Allow, &policy.networks, caller_ip) =>
-                    {
-                        Some("exclude")
-                    }
-                    IpAccessMode::Deny
-                        if !evaluate_with_set(IpAccessMode::Deny, &policy.networks, caller_ip) =>
-                    {
-                        Some("block")
-                    }
-                    _ => None,
-                };
-                if let Some(effect) = effect {
-                    return Err(ProjectIpAccessError::WouldLockOutCaller {
-                        scope,
-                        caller_ip: normalize_ip(caller_ip).to_string(),
-                        effect,
-                    });
-                }
-            }
-        }
+        check_lockout(&scope, &policy, caller_ip, request.acknowledge_lockout)?;
 
         self.ensure_scope_exists(project_id, environment_id).await?;
         let warnings = self
@@ -668,6 +749,96 @@ impl ProjectIpAccessService {
         };
         txn.commit().await?;
         Ok(saved)
+    }
+
+    async fn find_default(
+        &self,
+    ) -> Result<Option<instance_ip_access_default::Model>, sea_orm::DbErr> {
+        instance_ip_access_default::Entity::find_by_id(instance_ip_access_default::SINGLETON_ID)
+            .one(self.db.as_ref())
+            .await
+    }
+
+    /// The instance default, or an unconfigured placeholder.
+    pub async fn get_default(
+        &self,
+    ) -> Result<InstanceIpAccessDefaultResponse, ProjectIpAccessError> {
+        Ok(InstanceIpAccessDefaultResponse::from(
+            self.find_default().await?,
+        ))
+    }
+
+    /// Validate and store the instance default. Same validation and lock-out
+    /// check as a project policy.
+    pub async fn set_default(
+        &self,
+        request: SetProjectIpAccessRequest,
+        caller_ip: Option<IpAddr>,
+        updated_by: Option<i32>,
+    ) -> Result<InstanceIpAccessDefaultResponse, ProjectIpAccessError> {
+        let policy = validate_policy(INSTANCE_DEFAULT_SCOPE, request.mode, &request.cidrs)?;
+        check_lockout(
+            INSTANCE_DEFAULT_SCOPE,
+            &policy,
+            caller_ip,
+            request.acknowledge_lockout,
+        )?;
+        // shortcut: the D9 tunnel check is per environment and is not run
+        // across every project here; a private-only allow default only warns.
+        // Upgrade to a full check if operators hit it.
+        let warnings =
+            if policy.mode == IpAccessMode::Allow && only_private_ranges(&policy.networks) {
+                vec![
+                "This allow list names only private ranges. Visitors of any project that arrive \
+                 through a tunnel or a load balancer will be blocked; give such projects a policy \
+                 of their own."
+                    .to_string(),
+            ]
+            } else {
+                Vec::new()
+            };
+
+        let now = Utc::now();
+        let row = instance_ip_access_default::ActiveModel {
+            id: Set(instance_ip_access_default::SINGLETON_ID),
+            mode: Set(policy.mode.as_str().to_string()),
+            cidrs: Set(IpAccessCidrs(policy.entries)),
+            updated_by: Set(updated_by),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        let saved = instance_ip_access_default::Entity::insert(row)
+            .on_conflict(
+                OnConflict::column(instance_ip_access_default::Column::Id)
+                    .update_columns([
+                        instance_ip_access_default::Column::Mode,
+                        instance_ip_access_default::Column::Cidrs,
+                        instance_ip_access_default::Column::UpdatedBy,
+                        instance_ip_access_default::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec_with_returning(self.db.as_ref())
+            .await?;
+        let mut response = InstanceIpAccessDefaultResponse::from(Some(saved));
+        response.warnings = warnings;
+        Ok(response)
+    }
+
+    /// Remove the instance default: projects without a policy of their own
+    /// become reachable from any address again.
+    pub async fn delete_default(&self) -> Result<(), ProjectIpAccessError> {
+        let result = instance_ip_access_default::Entity::delete_by_id(
+            instance_ip_access_default::SINGLETON_ID,
+        )
+        .exec(self.db.as_ref())
+        .await?;
+        if result.rows_affected == 0 {
+            return Err(ProjectIpAccessError::PolicyNotFound {
+                scope: INSTANCE_DEFAULT_SCOPE.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Remove one scope's policy. For an environment this returns it to
@@ -750,11 +921,20 @@ impl ProjectIpAccessService {
                         self.find_row(project_id, None).await?,
                     ),
                 };
-                match row {
-                    Some(row) => {
-                        let stored_mode = IpAccessMode::parse(&row.mode);
-                        let total = row.cidrs.0.len();
-                        let (entries, networks) = aligned_policy(row.cidrs.0);
+                // No row of its own (a disabled one still counts): the
+                // instance default governs, exactly as in the proxy's gate.
+                let stored = match row {
+                    Some(row) => Some((source, row.mode, row.cidrs.0)),
+                    None => self
+                        .find_default()
+                        .await?
+                        .map(|default| (PolicySource::Instance, default.mode, default.cidrs.0)),
+                };
+                match stored {
+                    Some((source, stored_mode_text, stored_cidrs)) => {
+                        let stored_mode = IpAccessMode::parse(&stored_mode_text);
+                        let total = stored_cidrs.len();
+                        let (entries, networks) = aligned_policy(stored_cidrs);
                         let unreadable = total - entries.len();
                         match stored_mode {
                             // Same rules as the proxy's compile step: an
@@ -764,7 +944,7 @@ impl ProjectIpAccessService {
                                 fail_closed = Some(format!(
                                     "Blocked: the stored mode '{}' is not recognised, so every \
                                      address is refused until the policy is saved again.",
-                                    row.mode
+                                    stored_mode_text
                                 ));
                                 (source, IpAccessMode::Allow, Vec::new(), Vec::new())
                             }
@@ -802,6 +982,7 @@ impl ProjectIpAccessService {
         };
 
         let (allowed, matched_cidr) = evaluate(mode, &entries, &networks, ip);
+        let from_instance_default = source == PolicySource::Instance;
         let reason = match (mode, &matched_cidr) {
             (IpAccessMode::Allow, _) if fail_closed.is_some() => fail_closed.unwrap_or_default(),
             (IpAccessMode::Disabled, _) => {
@@ -819,6 +1000,11 @@ impl ProjectIpAccessService {
             (IpAccessMode::Deny, None) => {
                 format!("Allowed: {ip} is not inside any CIDR on the deny list.")
             }
+        };
+        let reason = if from_instance_default {
+            format!("{reason} The list is the instance default: no project or environment policy applies.")
+        } else {
+            reason
         };
 
         Ok(TestProjectIpAccessResponse {
@@ -1063,6 +1249,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![id_row(5)]])
             .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_results(vec![Vec::<instance_ip_access_default::Model>::new()])
             .into_connection();
         let service = ProjectIpAccessService::new(Arc::new(db));
 
@@ -1071,6 +1258,40 @@ mod tests {
         assert_eq!(response.mode, IpAccessMode::Disabled);
         assert!(response.cidrs.is_empty());
         assert_eq!(response.max_cidrs, MAX_CIDRS_PER_POLICY);
+        assert_eq!(response.instance_default_mode, None);
+    }
+
+    #[tokio::test]
+    async fn get_reports_the_instance_default_a_scope_without_a_policy_follows() {
+        // Environment 9 has no row and neither does its project: the default
+        // applies and the response says which mode.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![id_row(9)]])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_results(vec![vec![default_model("allow", &["10.0.0.0/8"])]])
+            .into_connection();
+        let response = ProjectIpAccessService::new(Arc::new(db))
+            .get(5, Some(9))
+            .await
+            .expect("get succeeds");
+        assert!(!response.configured);
+        assert_eq!(response.instance_default_mode, Some(IpAccessMode::Allow));
+
+        // With a project row (even a disabled one) the default does not
+        // apply, and is not read.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![id_row(9)]])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_results(vec![vec![rule_row(5, None, "disabled", &[])]])
+            .into_connection();
+        let response = ProjectIpAccessService::new(Arc::new(db))
+            .get(5, Some(9))
+            .await
+            .expect("get succeeds");
+        assert_eq!(response.instance_default_mode, None);
     }
 
     #[tokio::test]
@@ -1581,6 +1802,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![id_row(5)]])
             .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_results(vec![Vec::<instance_ip_access_default::Model>::new()])
             .into_connection();
         let service = ProjectIpAccessService::new(Arc::new(db));
 
@@ -1723,5 +1945,156 @@ mod tests {
             .expect("test succeeds");
         assert!(response.allowed);
         assert_eq!(response.matched_cidr.as_deref(), Some("10.0.0.0/8"));
+    }
+
+    // ---- instance default ----------------------------------------------
+
+    fn default_model(mode: &str, cidrs: &[&str]) -> instance_ip_access_default::Model {
+        let now = chrono::Utc::now();
+        instance_ip_access_default::Model {
+            id: instance_ip_access_default::SINGLETON_ID,
+            mode: mode.into(),
+            cidrs: IpAccessCidrs(cidrs.iter().map(|c| entry(c)).collect()),
+            updated_by: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn set_request(mode: IpAccessMode, cidrs: &[&str]) -> SetProjectIpAccessRequest {
+        SetProjectIpAccessRequest {
+            mode,
+            cidrs: cidrs.iter().map(|c| entry(c)).collect(),
+            acknowledge_lockout: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_falls_back_to_the_instance_default_like_the_gate() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_results(vec![vec![default_model("allow", &["10.0.0.0/8"])]])
+            .into_connection();
+        let response = ProjectIpAccessService::new(Arc::new(db))
+            .test(5, None, probe("8.8.8.8"))
+            .await
+            .expect("test succeeds");
+        assert_eq!(response.source, PolicySource::Instance);
+        assert!(!response.allowed);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_project_policy_opts_out_of_the_instance_default() {
+        // No default query is queued: reading it would fail the test.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![rule_row(5, None, "disabled", &[])]])
+            .into_connection();
+        let response = ProjectIpAccessService::new(Arc::new(db))
+            .test(5, None, probe("8.8.8.8"))
+            .await
+            .expect("test succeeds");
+        assert_eq!(response.source, PolicySource::None);
+        assert!(response.allowed);
+    }
+
+    #[tokio::test]
+    async fn get_default_is_an_unconfigured_placeholder_without_a_row() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<instance_ip_access_default::Model>::new()])
+            .into_connection();
+        let response = ProjectIpAccessService::new(Arc::new(db))
+            .get_default()
+            .await
+            .expect("get succeeds");
+        assert!(!response.configured);
+        assert_eq!(response.mode, IpAccessMode::Disabled);
+        assert_eq!(response.max_cidrs, MAX_CIDRS_PER_POLICY);
+    }
+
+    #[tokio::test]
+    async fn set_default_validates_and_checks_lockout_before_the_database() {
+        // An empty mock: any query would fail the call with a database error.
+        let service = ProjectIpAccessService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let invalid = service
+            .set_default(
+                set_request(IpAccessMode::Allow, &["not-a-cidr"]),
+                None,
+                Some(1),
+            )
+            .await;
+        assert!(
+            matches!(invalid, Err(ProjectIpAccessError::InvalidCidr { ref scope, .. }) if scope == INSTANCE_DEFAULT_SCOPE),
+            "{invalid:?}"
+        );
+        let empty = service
+            .set_default(set_request(IpAccessMode::Allow, &[]), None, Some(1))
+            .await;
+        assert!(matches!(
+            empty,
+            Err(ProjectIpAccessError::EmptyAllowList { .. })
+        ));
+        let locked_out = service
+            .set_default(
+                set_request(IpAccessMode::Allow, &["10.0.0.0/8"]),
+                Some(ip("203.0.113.9")),
+                Some(1),
+            )
+            .await;
+        assert!(
+            matches!(
+                locked_out,
+                Err(ProjectIpAccessError::WouldLockOutCaller {
+                    effect: "exclude",
+                    ..
+                })
+            ),
+            "{locked_out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_default_upserts_the_single_row_and_warns_on_private_only_lists() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![default_model("allow", &["100.64.0.0/10"])]])
+            .into_connection();
+        let db = Arc::new(db);
+        let response = ProjectIpAccessService::new(Arc::clone(&db))
+            .set_default(
+                set_request(IpAccessMode::Allow, &["100.64.0.0/10"]),
+                Some(ip("100.64.1.2")),
+                Some(1),
+            )
+            .await
+            .expect("saved");
+        assert!(response.configured);
+        assert_eq!(response.mode, IpAccessMode::Allow);
+        assert_eq!(response.warnings.len(), 1, "{:?}", response.warnings);
+        let log = Arc::try_unwrap(db)
+            .map_err(|_| "service still holds the database")
+            .expect("released")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(sql.contains("ON CONFLICT"), "single-row upsert: {sql}");
+    }
+
+    #[tokio::test]
+    async fn delete_default_without_a_row_is_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+        let result = ProjectIpAccessService::new(Arc::new(db))
+            .delete_default()
+            .await;
+        assert!(
+            matches!(result, Err(ProjectIpAccessError::PolicyNotFound { ref scope }) if scope == INSTANCE_DEFAULT_SCOPE),
+            "{result:?}"
+        );
     }
 }

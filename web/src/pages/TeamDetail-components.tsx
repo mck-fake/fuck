@@ -4,6 +4,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   addTeamMemberMutation,
+  assignCustomRoleMutation,
+  listCustomRolesOptions,
+  listTeamCustomRolesOptions,
+  listTeamCustomRolesQueryKey,
+  unassignCustomRoleMutation,
   getProjectsOptions,
   getTeamOptions,
   getTeamQueryKey,
@@ -361,6 +366,86 @@ function MemberRoleCell({
   )
 }
 
+const FIXED_ROLE = 'fixed'
+
+/**
+ * Optional custom role for one membership. "Fixed role" means the role
+ * picked above applies; a custom role replaces it, still capped by the
+ * team's grant on each project.
+ */
+function MemberCustomRoleCell({
+  teamId,
+  member,
+}: {
+  teamId: number
+  member: TeamMemberResponse
+}) {
+  const queryClient = useQueryClient()
+  const assignments = useQuery(
+    listTeamCustomRolesOptions({ path: { team_id: teamId } })
+  )
+  const roles = useQuery(listCustomRolesOptions({ query: { page_size: 100 } }))
+  const current = assignments.data?.find((a) => a.user_id === member.user_id)
+  const onDone = async (message: string) => {
+    toast.success(message)
+    await queryClient.invalidateQueries({
+      queryKey: listTeamCustomRolesQueryKey({ path: { team_id: teamId } }),
+    })
+  }
+  const assign = useMutation({
+    ...assignCustomRoleMutation(),
+    onSuccess: () => onDone('Custom role assigned'),
+    onError: (err: Error) =>
+      toast.error(err.message || 'Failed to assign the custom role'),
+  })
+  const unassign = useMutation({
+    ...unassignCustomRoleMutation(),
+    onSuccess: () => onDone('Back on the fixed role'),
+    onError: (err: Error) =>
+      toast.error(err.message || 'Failed to remove the custom role'),
+  })
+  const available = roles.data?.roles ?? []
+
+  if (assignments.isLoading || roles.isLoading) {
+    return <Skeleton className="h-9 w-full" />
+  }
+  // Nothing to choose from and nothing assigned: say where roles come from.
+  if (available.length === 0 && !current) {
+    return (
+      <Link
+        to="/settings/roles"
+        className="text-xs text-muted-foreground underline-offset-4 hover:underline"
+      >
+        Create a custom role
+      </Link>
+    )
+  }
+  const path = { team_id: teamId, user_id: member.user_id }
+  return (
+    <Select
+      value={current ? String(current.custom_role_id) : FIXED_ROLE}
+      disabled={assign.isPending || unassign.isPending}
+      onValueChange={(value) =>
+        value === FIXED_ROLE
+          ? unassign.mutate({ path })
+          : assign.mutate({ path, body: { custom_role_id: Number(value) } })
+      }
+    >
+      <SelectTrigger aria-label="Custom role">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={FIXED_ROLE}>Fixed role</SelectItem>
+        {available.map((role) => (
+          <SelectItem key={role.id} value={String(role.id)}>
+            {role.name}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
+
 function MembersSkeleton() {
   return (
     <div className="space-y-2">
@@ -572,8 +657,9 @@ export function TeamDetail() {
                       <TableCell className="hidden text-muted-foreground md:table-cell">
                         {member.user_email ?? '—'}
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="space-y-2">
                         <MemberRoleCell teamId={teamId} member={member} />
+                        <MemberCustomRoleCell teamId={teamId} member={member} />
                       </TableCell>
                       <TableCell>
                         <Button

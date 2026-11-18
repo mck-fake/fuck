@@ -10,10 +10,13 @@ use temps_core::{
 };
 use utoipa::ToSchema;
 
+mod branding;
 mod env_migration;
 mod otel_backup;
 #[cfg(test)]
 mod tests;
+
+pub use branding::{BrandingError, BrandingSettings};
 
 pub use env_migration::{
     decide_env_setting_migration, decide_secret_env_migration, record_env_setting_persisted,
@@ -323,6 +326,20 @@ pub struct AppSettings {
     /// restarting the binary.
     #[serde(default)]
     pub require_mfa_for_admins: bool,
+
+    /// When `true`, sign-in is SSO only: password login, password-reset
+    /// requests and password-reset completion are refused for every account.
+    /// OIDC sign-ins, API keys and deployment tokens are unaffected. Off by
+    /// default so an upgrade never locks anyone out; `temps
+    /// reset-admin-password` turns it back off as the break-glass path.
+    #[serde(default)]
+    pub password_login_disabled: bool,
+
+    /// White-label console branding (name, colour, logo, favicon). Empty by
+    /// default, which keeps the built-in look. Served unauthenticated by
+    /// `GET /branding`, so it must never hold anything secret.
+    #[serde(default)]
+    pub branding: BrandingSettings,
 
     /// Share verified external-plugin installation counts with the official
     /// registry. Defaults to off; each plugin receives an unlinkable ID.
@@ -2565,6 +2582,8 @@ impl Default for AppSettings {
             shield: ShieldSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
+            password_login_disabled: false,
+            branding: BrandingSettings::default(),
             plugin_installation_reporting_enabled: false,
             anonymous_telemetry_enabled: None,
             self_update: None,

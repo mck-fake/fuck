@@ -17,6 +17,7 @@ import {
   showsEntries,
   entriesToSave,
   policySummary,
+  scopeBadge,
   withPresets,
 } from './ip-access'
 
@@ -288,5 +289,30 @@ describe('helpers', () => {
     expect(policySummary('allow', 1)).toBe('Only 1 range can reach this')
     expect(policySummary('deny', 3)).toBe('3 ranges blocked')
     expect(policySummary('disabled', 0)).toBe('Open to everyone')
+  })
+})
+
+describe('scopeBadge', () => {
+  const unconfigured = { configured: false, mode: 'disabled' as const, cidrs: [] }
+
+  test('a scope with no list of its own names the instance default when one applies', () => {
+    const governed = { ...unconfigured, instance_default_mode: 'allow' as const }
+    expect(scopeBadge(governed, false)).toBe('Follows the instance default')
+    expect(scopeBadge(governed, true)).toBe('Follows the instance default')
+  })
+
+  test('without a default an environment follows its project and a project is open', () => {
+    expect(scopeBadge(unconfigured, true)).toBe('Follows the project list')
+    expect(scopeBadge(unconfigured, false)).toBe('Open to everyone')
+  })
+
+  test('a scope with its own list describes that list, default or not', () => {
+    const own = {
+      configured: true,
+      mode: 'deny' as const,
+      cidrs: [{}, {}],
+      instance_default_mode: null,
+    }
+    expect(scopeBadge(own, false)).toBe('2 ranges blocked')
   })
 })

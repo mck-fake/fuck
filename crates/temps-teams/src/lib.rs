@@ -43,6 +43,7 @@
 //! narrow a member below their team's access, never widen them past it.
 
 pub mod checker;
+pub mod custom_roles;
 pub mod error;
 pub mod handlers;
 pub mod plugin;
@@ -50,6 +51,7 @@ pub mod role_permissions;
 pub mod service;
 
 pub use checker::TeamProjectAccessChecker;
+pub use custom_roles::{CustomRoleResolver, CustomRoleService};
 pub use error::TeamError;
 pub use handlers::{TeamsApiDoc, TeamsAppState};
 pub use plugin::TeamsPlugin;

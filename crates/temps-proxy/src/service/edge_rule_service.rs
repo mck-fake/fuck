@@ -13,6 +13,10 @@
 //! positions cannot be raced. Edits carry the rule's `revision`; a stale one is
 //! refused with [`EdgeRuleServiceError::RevisionConflict`] instead of
 //! overwriting someone else's change.
+//!
+//! Every write also stores, in the same transaction, a numbered snapshot of
+//! the whole rule set in `project_edge_rule_revisions` (ADR-089 A1); the last
+//! [`MAX_REVISIONS_PER_PROJECT`] are kept and any of them can be restored.
 
 use crate::edge_rules::definition_from_model;
 use chrono::{DateTime, Utc};
@@ -29,7 +33,7 @@ use temps_edge_rules::{
     auto_name, limits, prepare_expression, validate_rule, Action, Decision, Group, Mode,
     ParsedSample, PatternUsage, Program, RuleDefinition, RuleIssue, RuleOutcome, SampleRequest,
 };
-use temps_entities::{environments, project_edge_rules, projects};
+use temps_entities::{environments, project_edge_rule_revisions, project_edge_rules, projects};
 use thiserror::Error;
 use tracing::warn;
 use utoipa::ToSchema;
@@ -82,6 +86,16 @@ pub enum EdgeRuleServiceError {
     Unreadable {
         project_id: i32,
         rule_id: i32,
+        reason: String,
+    },
+
+    #[error("Edge rule revision {number} not found in project {project_id}")]
+    RevisionNotFound { project_id: i32, number: i32 },
+
+    #[error("Edge rule revision {number} of project {project_id} cannot be restored ({reason})")]
+    UnreadableRevision {
+        project_id: i32,
+        number: i32,
         reason: String,
     },
 
@@ -276,6 +290,78 @@ pub struct EvaluateEdgeRulesResponse {
     pub trace: Vec<EvaluateTraceEntry>,
 }
 
+/// Revisions kept per project; older ones are pruned on every write.
+pub const MAX_REVISIONS_PER_PROJECT: i32 = 100;
+
+/// One revision in the history list.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, FromQueryResult)]
+pub struct EdgeRuleRevisionSummary {
+    /// 1, 2, 3... per project; the highest is the rule set in force.
+    pub number: i32,
+    /// What the write did, e.g. "Created rule 'Block /admin'".
+    pub change: String,
+    pub rule_count: i32,
+    pub created_by: Option<i32>,
+    pub created_by_name: Option<String>,
+    #[schema(value_type = String, format = "date-time", example = "2026-11-17T09:30:00Z")]
+    pub created_at: DateTime<Utc>,
+}
+
+/// A page of a project's revisions, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EdgeRuleRevisionListResponse {
+    pub project_id: i32,
+    pub revisions: Vec<EdgeRuleRevisionSummary>,
+    pub total: i64,
+    pub page: u64,
+    pub per_page: u64,
+    /// How many revisions are kept; older ones are pruned.
+    pub max_revisions: i32,
+}
+
+/// One rule as a revision stored it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EdgeRuleRevisionRule {
+    pub id: i32,
+    pub environment_id: Option<i32>,
+    pub name: String,
+    pub enabled: bool,
+    pub mode: Mode,
+    pub expression: Group,
+    pub action: Action,
+}
+
+/// A revision with its whole rule set, in evaluation order.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EdgeRuleRevisionResponse {
+    pub project_id: i32,
+    #[serde(flatten)]
+    pub revision: EdgeRuleRevisionSummary,
+    pub rules: Vec<EdgeRuleRevisionRule>,
+}
+
+/// The snapshot of a project's rules a write leaves behind, built in SQL
+/// from the raw columns so a rule this version cannot decode never blocks
+/// an unrelated write. `$1` project, `$2` change, `$3` author.
+const RECORD_REVISION_SQL: &str = "INSERT INTO project_edge_rule_revisions \
+     (project_id, number, rules, change, created_by) \
+     SELECT $1, COALESCE((SELECT MAX(number) FROM project_edge_rule_revisions \
+     WHERE project_id = $1), 0) + 1, \
+     COALESCE((SELECT jsonb_agg(jsonb_build_object('id', id, 'environment_id', \
+     environment_id, 'name', name, 'enabled', enabled, 'mode', mode, 'expression', \
+     expression, 'action', action) ORDER BY position, id) FROM project_edge_rules \
+     WHERE project_id = $1), '[]'::jsonb), $2, $3";
+
+const PRUNE_REVISIONS_SQL: &str = "DELETE FROM project_edge_rule_revisions \
+     WHERE project_id = $1 AND number <= (SELECT MAX(number) FROM \
+     project_edge_rule_revisions WHERE project_id = $1) - $2";
+
+const REVISION_SUMMARY_SQL: &str = "SELECT r.number, r.change, \
+     jsonb_array_length(r.rules)::int AS rule_count, r.created_by, \
+     u.name AS created_by_name, r.created_at \
+     FROM project_edge_rule_revisions r LEFT JOIN users u ON u.id = r.created_by \
+     WHERE r.project_id = $1";
+
 // ---- service -----------------------------------------------------------
 
 #[derive(Debug, FromQueryResult)]
@@ -385,6 +471,33 @@ impl EdgeRuleService {
             DatabaseBackend::Postgres,
             "SELECT pg_notify('project_route_change', $1)",
             [payload.into()],
+        ))
+        .await
+        .map_err(db_error(project_id))?;
+        Ok(())
+    }
+
+    /// Stores the rule set as it stands in `txn` as the next revision and
+    /// prunes the oldest beyond [`MAX_REVISIONS_PER_PROJECT`]. Called by
+    /// every write under the project lock, so numbers never race.
+    async fn record_revision(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        user_id: Option<i32>,
+        change: String,
+    ) -> Result<(), EdgeRuleServiceError> {
+        let change: String = change.chars().take(200).collect();
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            RECORD_REVISION_SQL,
+            [project_id.into(), change.into(), user_id.into()],
+        ))
+        .await
+        .map_err(db_error(project_id))?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            PRUNE_REVISIONS_SQL,
+            [project_id.into(), MAX_REVISIONS_PER_PROJECT.into()],
         ))
         .await
         .map_err(db_error(project_id))?;
@@ -676,6 +789,13 @@ impl EdgeRuleService {
         if model.enabled {
             Self::announce_route_change(&txn, project_id).await?;
         }
+        Self::record_revision(
+            &txn,
+            project_id,
+            user_id,
+            format!("Created rule '{}'", model.name),
+        )
+        .await?;
         txn.commit().await.map_err(db_error(project_id))?;
         Self::to_response(&model, None)
     }
@@ -740,6 +860,13 @@ impl EdgeRuleService {
         if model.enabled != current.enabled {
             Self::announce_route_change(&txn, project_id).await?;
         }
+        Self::record_revision(
+            &txn,
+            project_id,
+            user_id,
+            format!("Edited rule '{}'", model.name),
+        )
+        .await?;
         txn.commit().await.map_err(db_error(project_id))?;
         let after = Self::to_response(&model, stats.get(&rule_id))?;
         Ok((before, after))
@@ -754,6 +881,7 @@ impl EdgeRuleService {
         project_id: i32,
         rule_id: i32,
         expected_revision: Option<i64>,
+        user_id: Option<i32>,
     ) -> Result<EdgeRuleResponse, EdgeRuleServiceError> {
         let txn = self.db.begin().await.map_err(db_error(project_id))?;
         self.ensure_project(&txn, project_id).await?;
@@ -789,6 +917,13 @@ impl EdgeRuleService {
         if current.enabled {
             Self::announce_route_change(&txn, project_id).await?;
         }
+        Self::record_revision(
+            &txn,
+            project_id,
+            user_id,
+            format!("Deleted rule '{}'", current.name),
+        )
+        .await?;
         txn.commit().await.map_err(db_error(project_id))?;
         Ok(response)
     }
@@ -799,6 +934,7 @@ impl EdgeRuleService {
         &self,
         project_id: i32,
         request: ReorderEdgeRulesRequest,
+        user_id: Option<i32>,
     ) -> Result<EdgeRuleListResponse, EdgeRuleServiceError> {
         let txn = self.db.begin().await.map_err(db_error(project_id))?;
         self.ensure_project(&txn, project_id).await?;
@@ -843,6 +979,7 @@ impl EdgeRuleService {
             .await
             .map_err(db_error(project_id))?;
         }
+        Self::record_revision(&txn, project_id, user_id, "Reordered the rules".into()).await?;
         txn.commit().await.map_err(db_error(project_id))?;
         self.list(project_id).await
     }
@@ -939,6 +1076,240 @@ impl EdgeRuleService {
                 .collect(),
         })
     }
+
+    /// A page of the project's revisions, newest first.
+    pub async fn list_revisions(
+        &self,
+        project_id: i32,
+        page: u64,
+        per_page: u64,
+    ) -> Result<EdgeRuleRevisionListResponse, EdgeRuleServiceError> {
+        let conn = self.db.as_ref();
+        self.ensure_project(conn, project_id).await?;
+        let per_page = per_page.clamp(1, 100);
+        let page = page.max(1);
+        let total = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS count FROM project_edge_rule_revisions \
+             WHERE project_id = $1",
+            [project_id.into()],
+        ))
+        .one(conn)
+        .await
+        .map_err(db_error(project_id))?
+        .map_or(0, |r| r.count);
+        let offset = i64::try_from((page - 1).saturating_mul(per_page)).unwrap_or(i64::MAX);
+        let limit = i64::try_from(per_page).unwrap_or(100);
+        let revisions = EdgeRuleRevisionSummary::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            format!("{REVISION_SUMMARY_SQL} ORDER BY r.number DESC LIMIT $2 OFFSET $3"),
+            [project_id.into(), limit.into(), offset.into()],
+        ))
+        .all(conn)
+        .await
+        .map_err(db_error(project_id))?;
+        Ok(EdgeRuleRevisionListResponse {
+            project_id,
+            revisions,
+            total,
+            page,
+            per_page,
+            max_revisions: MAX_REVISIONS_PER_PROJECT,
+        })
+    }
+
+    /// One revision with its whole rule set.
+    pub async fn get_revision(
+        &self,
+        project_id: i32,
+        number: i32,
+    ) -> Result<EdgeRuleRevisionResponse, EdgeRuleServiceError> {
+        let conn = self.db.as_ref();
+        self.ensure_project(conn, project_id).await?;
+        let revision = EdgeRuleRevisionSummary::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            format!("{REVISION_SUMMARY_SQL} AND r.number = $2"),
+            [project_id.into(), number.into()],
+        ))
+        .one(conn)
+        .await
+        .map_err(db_error(project_id))?
+        .ok_or(EdgeRuleServiceError::RevisionNotFound { project_id, number })?;
+        let rules = Self::revision_rules(conn, project_id, number).await?;
+        Ok(EdgeRuleRevisionResponse {
+            project_id,
+            revision,
+            rules,
+        })
+    }
+
+    async fn revision_rules<C: ConnectionTrait>(
+        conn: &C,
+        project_id: i32,
+        number: i32,
+    ) -> Result<Vec<EdgeRuleRevisionRule>, EdgeRuleServiceError> {
+        let row = project_edge_rule_revisions::Entity::find()
+            .filter(project_edge_rule_revisions::Column::ProjectId.eq(project_id))
+            .filter(project_edge_rule_revisions::Column::Number.eq(number))
+            .one(conn)
+            .await
+            .map_err(db_error(project_id))?
+            .ok_or(EdgeRuleServiceError::RevisionNotFound { project_id, number })?;
+        decode_revision_rules(project_id, number, row.rules)
+    }
+
+    /// Puts the project's rules back to revision `number` and records that
+    /// as a new revision. Rules keep their ids (and so their hit counters and
+    /// log attribution); rules added since are deleted. Every restored rule is
+    /// validated against today's engine and limits first, so a revision that
+    /// no longer fits is refused whole instead of applied in part.
+    pub async fn restore(
+        &self,
+        project_id: i32,
+        number: i32,
+        user_id: Option<i32>,
+    ) -> Result<EdgeRuleListResponse, EdgeRuleServiceError> {
+        let txn = self.db.begin().await.map_err(db_error(project_id))?;
+        self.ensure_project(&txn, project_id).await?;
+        Self::lock_project(&txn, project_id).await?;
+        let snapshot = Self::revision_rules(&txn, project_id, number).await?;
+        if snapshot.len() > limits::RULES_PER_PROJECT {
+            return Err(EdgeRuleServiceError::TooManyRules {
+                project_id,
+                max: limits::RULES_PER_PROJECT,
+            });
+        }
+        // A rule scoped to an environment deleted since is refused, not
+        // silently widened to every environment. One check per environment.
+        let environments: HashSet<i32> = snapshot.iter().filter_map(|r| r.environment_id).collect();
+        for environment_id in environments {
+            self.ensure_environment(&txn, project_id, Some(environment_id))
+                .await?;
+        }
+        let mut usage = PatternUsage::default();
+        let mut prepared = Vec::with_capacity(snapshot.len());
+        for rule in snapshot {
+            let ready = Self::prepare(
+                project_id,
+                Some(rule.name.as_str()),
+                rule.expression.clone(),
+                rule.action.clone(),
+            )?;
+            usage = usage.plus(PatternUsage::of(&ready.expression));
+            prepared.push((rule, ready));
+        }
+        Self::refuse_over_budget(project_id, "restored rule set", usage)?;
+
+        let keep: Vec<i32> = prepared.iter().map(|(rule, _)| rule.id).collect();
+        project_edge_rules::Entity::delete_many()
+            .filter(project_edge_rules::Column::ProjectId.eq(project_id))
+            .filter(project_edge_rules::Column::Id.is_not_in(keep))
+            .exec(&txn)
+            .await
+            .map_err(db_error(project_id))?;
+        let existing: HashMap<i32, project_edge_rules::Model> = Self::rules(&txn, project_id)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, m))
+            .collect();
+        for (index, (rule, ready)) in prepared.into_iter().enumerate() {
+            let position = i32::try_from(index).unwrap_or(i32::MAX);
+            let expression = to_json(project_id, &ready.expression)?;
+            let action = to_json(project_id, &ready.action)?;
+            match existing.get(&rule.id) {
+                Some(current) => {
+                    let mut active: project_edge_rules::ActiveModel = current.clone().into();
+                    active.position = Set(position);
+                    active.name = Set(ready.name);
+                    active.enabled = Set(rule.enabled);
+                    active.mode = Set(rule.mode.as_str().to_string());
+                    active.environment_id = Set(rule.environment_id);
+                    active.expression = Set(expression);
+                    active.action = Set(action);
+                    // Bumped so a challenge clearance or an open editor of
+                    // the old rule is invalidated like on any edit.
+                    active.revision = Set(current.revision + 1);
+                    active.updated_by = Set(user_id);
+                    active.updated_at = Set(Utc::now());
+                    active.update(&txn).await.map_err(db_error(project_id))?;
+                }
+                // Ids are never reused by the sequence, so the old id is free.
+                None => {
+                    project_edge_rules::ActiveModel {
+                        id: Set(rule.id),
+                        project_id: Set(project_id),
+                        environment_id: Set(rule.environment_id),
+                        position: Set(position),
+                        name: Set(ready.name),
+                        enabled: Set(rule.enabled),
+                        mode: Set(rule.mode.as_str().to_string()),
+                        expression: Set(expression),
+                        action: Set(action),
+                        revision: Set(1),
+                        created_by: Set(user_id),
+                        updated_by: Set(user_id),
+                        ..Default::default()
+                    }
+                    .insert(&txn)
+                    .await
+                    .map_err(db_error(project_id))?;
+                }
+            }
+        }
+        Self::announce_route_change(&txn, project_id).await?;
+        Self::record_revision(
+            &txn,
+            project_id,
+            user_id,
+            format!("Restored revision {number}"),
+        )
+        .await?;
+        txn.commit().await.map_err(db_error(project_id))?;
+        self.list(project_id).await
+    }
+}
+
+/// Decodes a stored snapshot; any rule this version cannot read makes the
+/// whole revision unreadable rather than silently dropping that rule.
+fn decode_revision_rules(
+    project_id: i32,
+    number: i32,
+    rules: serde_json::Value,
+) -> Result<Vec<EdgeRuleRevisionRule>, EdgeRuleServiceError> {
+    #[derive(Deserialize)]
+    struct Stored {
+        id: i32,
+        environment_id: Option<i32>,
+        name: String,
+        enabled: bool,
+        mode: String,
+        expression: Group,
+        action: Action,
+    }
+    let unreadable = |reason: String| EdgeRuleServiceError::UnreadableRevision {
+        project_id,
+        number,
+        reason,
+    };
+    let stored: Vec<Stored> =
+        serde_json::from_value(rules).map_err(|e| unreadable(e.to_string()))?;
+    stored
+        .into_iter()
+        .map(|rule| {
+            let mode = Mode::parse(&rule.mode).ok_or_else(|| {
+                unreadable(format!("rule {} has unknown mode '{}'", rule.id, rule.mode))
+            })?;
+            Ok(EdgeRuleRevisionRule {
+                id: rule.id,
+                environment_id: rule.environment_id,
+                name: rule.name,
+                enabled: rule.enabled,
+                mode,
+                expression: rule.expression,
+                action: rule.action,
+            })
+        })
+        .collect()
 }
 
 fn to_json<T: Serialize>(
@@ -1074,6 +1445,150 @@ pub(crate) mod tests {
         }
     }
 
+    async fn revision_numbers(service: &EdgeRuleService, project_id: i32) -> Vec<(i32, String)> {
+        service
+            .list_revisions(project_id, 1, 100)
+            .await
+            .expect("list revisions")
+            .revisions
+            .into_iter()
+            .map(|r| (r.number, r.change))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_write_records_a_numbered_revision_and_restore_brings_rules_back() {
+        let Some(db) = database().await else {
+            return;
+        };
+        let (project_id, _) = project(&db, "edge-revisions").await;
+        let service = EdgeRuleService::new(db.connection_arc());
+
+        let first = service
+            .create(project_id, block_admin(), None)
+            .await
+            .expect("create first");
+        let second = service
+            .create(
+                project_id,
+                rule_on("/api", serde_json::json!({"type": "log"})),
+                None,
+            )
+            .await
+            .expect("create second");
+        service
+            .delete(project_id, first.id, None, None)
+            .await
+            .expect("delete first");
+
+        let history = revision_numbers(&service, project_id).await;
+        assert_eq!(
+            history.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            [3, 2, 1],
+            "newest first, one per write: {history:?}"
+        );
+        assert!(history[0].1.starts_with("Deleted rule"), "{history:?}");
+
+        let two = service
+            .get_revision(project_id, 2)
+            .await
+            .expect("revision 2");
+        assert_eq!(
+            two.rules.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [first.id, second.id]
+        );
+
+        let restored = service
+            .restore(project_id, 2, None)
+            .await
+            .expect("restore revision 2");
+        assert_eq!(
+            restored.rules.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [first.id, second.id],
+            "the deleted rule comes back with its id, in its old position"
+        );
+        assert_eq!(restored.rules[0].name, first.name);
+        let history = revision_numbers(&service, project_id).await;
+        assert_eq!(history[0], (4, "Restored revision 2".to_string()));
+
+        // Restoring revision 1 removes the rule added after it.
+        let only_first = service
+            .restore(project_id, 1, None)
+            .await
+            .expect("restore revision 1");
+        assert_eq!(
+            only_first.rules.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [first.id]
+        );
+        assert!(matches!(
+            service.restore(project_id, 99, None).await,
+            Err(EdgeRuleServiceError::RevisionNotFound { number: 99, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_the_last_revisions_are_kept() {
+        let Some(db) = database().await else {
+            return;
+        };
+        let (project_id, _) = project(&db, "edge-revisions-cap").await;
+        let service = EdgeRuleService::new(db.connection_arc());
+        let rule = service
+            .create(project_id, block_admin(), None)
+            .await
+            .expect("create");
+        let writes = MAX_REVISIONS_PER_PROJECT + 4;
+        for i in 1..writes {
+            service
+                .update(
+                    project_id,
+                    rule.id,
+                    UpdateEdgeRuleRequest {
+                        enabled: Some(i % 2 == 0),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect("update");
+        }
+        let page = service
+            .list_revisions(project_id, 1, 1)
+            .await
+            .expect("list revisions");
+        assert_eq!(page.total, i64::from(MAX_REVISIONS_PER_PROJECT));
+        assert_eq!(page.revisions[0].number, writes, "the newest is kept");
+        let oldest = service
+            .list_revisions(
+                project_id,
+                u64::try_from(MAX_REVISIONS_PER_PROJECT).unwrap_or(100),
+                1,
+            )
+            .await
+            .expect("last page");
+        assert_eq!(
+            oldest.revisions[0].number,
+            writes - MAX_REVISIONS_PER_PROJECT + 1
+        );
+    }
+
+    #[test]
+    fn a_revision_with_an_unknown_mode_is_unreadable_not_partially_restored() {
+        let rules = serde_json::json!([{
+            "id": 1, "environment_id": null, "name": "r", "enabled": true, "mode": "panic",
+            "expression": {"combinator": "all", "children": []},
+            "action": {"type": "log"}
+        }]);
+        assert!(matches!(
+            decode_revision_rules(3, 7, rules),
+            Err(EdgeRuleServiceError::UnreadableRevision {
+                project_id: 3,
+                number: 7,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn invalid_rules_are_refused_with_every_issue() {
         let request: CreateEdgeRuleRequest = serde_json::from_value(serde_json::json!({
@@ -1202,7 +1717,7 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| panic!("create enabled: {e}"));
         assert_eq!(route_announcements(&mut listener, project_id).await, 1);
         service
-            .delete(project_id, enabled.id, None)
+            .delete(project_id, enabled.id, None, None)
             .await
             .unwrap_or_else(|e| panic!("delete enabled: {e}"));
         assert_eq!(route_announcements(&mut listener, project_id).await, 1);
@@ -1231,7 +1746,7 @@ pub(crate) mod tests {
             Err(EdgeRuleServiceError::RevisionConflict { .. })
         ));
         service
-            .delete(project_id, disabled.id, None)
+            .delete(project_id, disabled.id, None, None)
             .await
             .unwrap_or_else(|e| panic!("delete disabled: {e}"));
         assert_eq!(route_announcements(&mut listener, project_id).await, 0);
@@ -1316,6 +1831,7 @@ pub(crate) mod tests {
                 ReorderEdgeRulesRequest {
                     rule_ids: vec![first.id, second.id],
                 },
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("reorder: {e}"));
@@ -1328,6 +1844,7 @@ pub(crate) mod tests {
                 ReorderEdgeRulesRequest {
                     rule_ids: vec![first.id],
                 },
+                None,
             )
             .await;
         assert!(matches!(
@@ -1341,14 +1858,14 @@ pub(crate) mod tests {
             .await
             .unwrap_or_else(|e| panic!("get: {e}"));
         let stale = service
-            .delete(project_id, first.id, Some(current.revision - 1))
+            .delete(project_id, first.id, Some(current.revision - 1), None)
             .await;
         assert!(matches!(
             stale,
             Err(EdgeRuleServiceError::RevisionConflict { .. })
         ));
         service
-            .delete(project_id, first.id, Some(current.revision))
+            .delete(project_id, first.id, Some(current.revision), None)
             .await
             .unwrap_or_else(|e| panic!("delete: {e}"));
         let listed = service
@@ -1358,7 +1875,7 @@ pub(crate) mod tests {
         assert_eq!(listed.rules.len(), 1);
         assert_eq!(listed.rules[0].position, 0, "the gap is closed");
 
-        let missing = service.delete(project_id, first.id, None).await;
+        let missing = service.delete(project_id, first.id, None, None).await;
         assert!(matches!(
             missing,
             Err(EdgeRuleServiceError::RuleNotFound { rule_id, .. }) if rule_id == first.id

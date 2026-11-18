@@ -28,3 +28,21 @@ of spammers.txt from the Matomo referrer-spam-list project
 (https://github.com/matomo-org/referrer-spam-list, commit
 eaaa5eaa6990be274fb560488a155459f735318d), which its maintainers publish in
 the Public Domain (no copyright).
+
+
+---------------------------------------------------------------------------
+Third-party data: Coolify service template references and logos
+---------------------------------------------------------------------------
+
+The service templates umami, n8n, grafana, wikijs and gotenberg in
+crates/temps-presets/templates/services/ were written for Temps; their
+images, ports, health checks and environment variables were cross-checked
+against the corresponding templates of Coolify
+(https://github.com/coollabsio/coolify), which is licensed under the Apache
+License, Version 2.0.
+
+The matching logo files in web/public/templates/ (umami.svg, n8n.png,
+grafana.svg, wikijs.svg, gotenberg.png)
+are copies of files from Coolify's public/svgs directory. Each logo is a
+trademark of its respective project and is used only to identify the
+software the template deploys.

@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Grafana OSS as one container; users, dashboards, alert rules and data
+# sources live in a Temps-managed PostgreSQL database instead of SQLite.
+# Settings cross-checked against Coolify's grafana-with-postgresql.yaml template (https://github.com/coollabsio/coolify, Apache-2.0).
+slug: grafana
+name: Grafana
+version: 1.0.0
+kind: app
+description: Dashboards, alerting and data exploration for metrics, logs and SQL sources, backed by a Temps-managed PostgreSQL database.
+git:
+  url: https://github.com/grafana/grafana.git
+  ref: v13.3.1
+preset: dockerfile
+image_url: /templates/grafana.svg
+# Tag 13.3.1, multi-arch (linux/amd64, linux/arm64, linux/arm/v7) index digest.
+image: grafana/grafana@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
+resources:
+  cpu_request: 250000
+  cpu_limit: 1000000
+  memory_request: 256
+  memory_limit: 1024
+exposed_port: 3000
+health_check_path: /api/health
+tags:
+  - monitoring
+  - dashboards
+  - observability
+  - alerting
+features:
+  - Dashboards and alerting over Prometheus, Loki, PostgreSQL and many more sources
+  - Users, dashboards, alert rules and data sources stored in Temps-managed PostgreSQL
+  - Generated administrator password and encryption key for data source secrets
+  - Plugins installed from the UI live on the container disk and need reinstalling after a redeploy
+services:
+  - postgres
+managed_service_bindings:
+  postgres:
+    GF_DATABASE_HOST: POSTGRES_HOST
+    GF_DATABASE_NAME: POSTGRES_DB
+    GF_DATABASE_USER: POSTGRES_USER
+    GF_DATABASE_PASSWORD: POSTGRES_PASSWORD
+env_vars:
+  - name: GF_DATABASE_TYPE
+    description: Grafana database engine
+    default: postgres
+    required: true
+  - name: GF_SERVER_ROOT_URL
+    description: Public Temps URL Grafana uses for links, redirects and OAuth callbacks
+    required: true
+    default_generator: app_url
+  - name: GF_SECURITY_ADMIN_USER
+    description: Initial administrator username, applied on the first start only
+    default: admin
+    required: true
+  - name: GF_SECURITY_ADMIN_PASSWORD
+    description: Initial administrator password, applied on the first start only
+    required: true
+    secret: true
+    default_generator: random_secret
+  - name: GF_SECURITY_SECRET_KEY
+    description: Key that encrypts data source credentials; keep it, or saved credentials become unreadable
+    required: true
+    secret: true
+    default_generator: random_secret
+is_public: true
+is_featured: false
+sort_order: 13

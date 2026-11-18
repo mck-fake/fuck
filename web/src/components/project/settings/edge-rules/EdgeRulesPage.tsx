@@ -39,6 +39,7 @@ import {
   ArrowUp,
   ChevronDown,
   FlaskConical,
+  History,
   ListFilter,
   MoreHorizontal,
   Plus,
@@ -61,6 +62,7 @@ import {
   useMoveEdgeRule,
   useUpdateEdgeRule,
 } from './store'
+import { RevisionHistorySheet } from './RevisionHistorySheet'
 import { RULE_TEMPLATES } from './templates'
 import { TestRequestSheet } from './TestRequestSheet'
 import type { EdgeRule } from './types'
@@ -79,6 +81,7 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
   const deleteRule = useDeleteEdgeRule(project.id)
   const moveRule = useMoveEdgeRule(project.id)
   const [testOpen, setTestOpen] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<EdgeRule | null>(null)
   // The row's "More actions" button. The menu item that opened the dialog is
   // gone by the time it closes, so focus goes back to the button instead.
@@ -196,15 +199,33 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
       </p>
 
       <div className="rounded-lg border bg-card text-card-foreground">
-        {rules.length > 0 && (
+        {/* Shown with no rules too: after deleting them all, restoring an
+            earlier version is exactly what is needed. */}
+        {rulesQuery.isSuccess && (
           <div className="flex items-center justify-between gap-2 border-b px-4 py-2">
             <p className="text-sm text-muted-foreground">
               {rules.length} {rules.length === 1 ? 'rule' : 'rules'}
             </p>
-            <Button variant="ghost" size="sm" onClick={() => setTestOpen(true)}>
-              <FlaskConical />
-              Test a request
-            </Button>
+            <div className="flex gap-1">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setHistoryOpen(true)}
+              >
+                <History />
+                History
+              </Button>
+              {rules.length > 0 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setTestOpen(true)}
+                >
+                  <FlaskConical />
+                  Test a request
+                </Button>
+              )}
+            </div>
           </div>
         )}
         <RulesCollection
@@ -272,6 +293,13 @@ export function EdgeRulesPage({ project }: EdgeRulesPageProps) {
         onOpenChange={setTestOpen}
         rules={rules}
         environments={environments}
+      />
+
+      <RevisionHistorySheet
+        projectId={project.id}
+        open={historyOpen}
+        onOpenChange={setHistoryOpen}
+        current={rules}
       />
 
       <ConfirmDeleteDialog

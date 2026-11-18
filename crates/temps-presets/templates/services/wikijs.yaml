@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Wiki.js 2.5 as one container; pages, history and uploaded files live in a
+# Temps-managed PostgreSQL database (the container disk only holds a cache).
+# Settings cross-checked against Coolify's wikijs.yaml template (https://github.com/coollabsio/coolify, Apache-2.0).
+slug: wikijs
+name: Wiki.js
+version: 1.0.0
+kind: app
+description: Open-source wiki with Markdown, visual and code editors, backed by a Temps-managed PostgreSQL database.
+git:
+  url: https://github.com/requarks/wiki.git
+  ref: v2.5.315
+preset: dockerfile
+image_url: /templates/wikijs.svg
+# Tag 2.5.315, multi-arch (linux/amd64, linux/arm64) index digest.
+image: ghcr.io/requarks/wiki@sha256:af71a17dc27ccc4c768591b1c504631ed820d9d13d4e8c325be4232c0035638c
+resources:
+  cpu_request: 250000
+  cpu_limit: 1000000
+  memory_request: 256
+  memory_limit: 1024
+exposed_port: 3000
+health_check_path: /healthz
+tags:
+  - wiki
+  - documentation
+  - knowledge-base
+  - collaboration
+features:
+  - Markdown, visual and code editors with page history
+  - Pages, history and uploaded files stored in Temps-managed PostgreSQL
+  - First visit opens the setup wizard that creates the administrator and sets the site URL
+  - Pinned to the mature 2.5 release line
+services:
+  - postgres
+managed_service_bindings:
+  postgres:
+    DB_HOST: POSTGRES_HOST
+    DB_PORT: POSTGRES_PORT
+    DB_NAME: POSTGRES_DB
+    DB_USER: POSTGRES_USER
+    DB_PASS: POSTGRES_PASSWORD
+env_vars:
+  - name: DB_TYPE
+    description: Wiki.js database engine
+    default: postgres
+    required: true
+is_public: true
+is_featured: false
+sort_order: 14

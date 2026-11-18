@@ -700,7 +700,9 @@ pub async fn worker_route_policy(
     custom_request_policy: bool,
 ) -> Result<WorkerRoutePolicy, (&'static str, sea_orm::DbErr)> {
     use sea_orm::{ColumnTrait, PaginatorTrait, QueryFilter};
-    use temps_entities::{ip_access_control, project_ip_access_rules, settings};
+    use temps_entities::{
+        instance_ip_access_default, ip_access_control, project_ip_access_rules, settings,
+    };
     let app_settings = settings::Entity::find()
         .one(db)
         .await
@@ -719,6 +721,13 @@ pub async fn worker_route_policy(
         .count(db)
         .await
         .map_err(|source| ("inspect public-ingress project IP access rules", source))?;
+    // The instance default is enforced by the same gate, so it blocks worker
+    // ingress the same way.
+    let instance_ip_default_count = instance_ip_access_default::Entity::find()
+        .filter(instance_ip_access_default::Column::Mode.ne("disabled"))
+        .count(db)
+        .await
+        .map_err(|source| ("inspect the instance default IP access policy", source))?;
     let project_rate_limit_count = count_project_rate_limit_policies(db)
         .await
         .map_err(|source| ("inspect project rate-limit policies", source))?;
@@ -750,6 +759,9 @@ pub async fn worker_route_policy(
     }
     if project_ip_rule_count > 0 {
         blocking_policies.push("project IP access rules are configured".to_string());
+    }
+    if instance_ip_default_count > 0 {
+        blocking_policies.push("an instance default IP access policy is configured".to_string());
     }
     if project_edge_rule_count > 0 {
         blocking_policies.push("project edge rules are enabled".to_string());
@@ -2230,6 +2242,36 @@ pub(crate) mod tests {
             .unsupported_reasons
             .iter()
             .any(|reason| reason == "project IP access rules are configured"));
+
+        // The instance default is enforced by the same control-plane gate, so
+        // an active one keeps routes off workers too; a disabled one does not.
+        let set_instance_default = |sql: &'static str| {
+            let db = test_db.db.clone();
+            async move {
+                use sea_orm::ConnectionTrait;
+                db.execute_unprepared(sql).await
+            }
+        };
+        set_instance_default(
+            "INSERT INTO instance_ip_access_default (id, mode, cidrs) \
+             VALUES (1, 'disabled', '[{\"cidr\": \"10.0.0.0/8\"}]'::jsonb)",
+        )
+        .await?;
+        let default_reason = "an instance default IP access policy is configured";
+        assert!(!build_with_open_gate()
+            .await?
+            .public_ingress
+            .unsupported_reasons
+            .iter()
+            .any(|reason| reason == default_reason));
+        set_instance_default("UPDATE instance_ip_access_default SET mode = 'allow'").await?;
+        assert!(build_with_open_gate()
+            .await?
+            .public_ingress
+            .unsupported_reasons
+            .iter()
+            .any(|reason| reason == default_reason));
+        set_instance_default("DELETE FROM instance_ip_access_default").await?;
 
         // Edge rules (ADR-089 §8) are evaluated on the control plane only. A
         // disabled rule leaves the worker shortcut alone; an enabled one, even

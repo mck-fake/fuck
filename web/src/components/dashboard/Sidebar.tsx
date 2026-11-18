@@ -29,14 +29,12 @@ import {
   Folder,
   Gauge,
   HelpCircle,
+  Languages,
   LogOut,
-  Monitor,
-  Moon,
   Search,
   MessageSquare,
   Server,
   Settings,
-  Sun,
   Sparkles,
   Terminal,
   Wand2,
@@ -49,6 +47,12 @@ import {
   getProjectBySlugOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
+import { useI18n } from '@/components/providers/I18nProvider'
+import {
+  THEME_OPTIONS,
+  themeOptionFor,
+} from '@/components/preferences/theme-options'
+import { LOCALE_NAMES, navTitle, type Locale } from '@/lib/i18n'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
@@ -440,6 +444,7 @@ function NavSection({
 }) {
   const location = useLocation()
   const { isMinimal, isMobile } = useSidebar()
+  const { t } = useI18n()
   const compact = isMinimal && !isMobile
   const allUrls = useMemo(
     () => [...items.map((i) => i.url), ...(siblingUrls ?? [])],
@@ -467,17 +472,18 @@ function NavSection({
       className={compact ? '' : 'group-data-[collapsible=icon]:hidden'}
     >
       <SidebarGroupLabel className={compact ? 'hidden' : ''}>
-        {label}
+        {navTitle(t, label)}
       </SidebarGroupLabel>
       <SidebarMenu>
         {items.map((item) => {
           const isActive =
             item.activeWhen?.(location.pathname) ?? item.url === activeUrl
+          const title = navTitle(t, item.title)
           return (
             <SidebarMenuItem key={item.id ?? item.url}>
               <SidebarMenuButton
                 asChild
-                tooltip={compact ? item.title : undefined}
+                tooltip={compact ? title : undefined}
                 className={cn(
                   compact ? 'justify-center' : 'justify-start',
                   isActive && 'bg-sidebar-accent text-sidebar-accent-foreground'
@@ -485,7 +491,7 @@ function NavSection({
               >
                 <Link to={item.url}>
                   <item.icon />
-                  {!compact && <span>{item.title}</span>}
+                  {!compact && <span>{title}</span>}
                   {!compact && (
                     <FeatureMaturityBadge
                       featureKey={item.featureKey}
@@ -590,24 +596,45 @@ function GettingStartedNavItem() {
 /** Light / Dark / System, nested under the account menu. */
 function ThemeSubmenu() {
   const { theme, setTheme } = useTheme()
-  const options = [
-    { value: 'light', label: 'Light', icon: Sun },
-    { value: 'dark', label: 'Dark', icon: Moon },
-    { value: 'system', label: 'System', icon: Monitor },
-  ] as const
-  const current = options.find((o) => o.value === theme) ?? options[2]
+  const { t } = useI18n()
+  const current = themeOptionFor(theme)
   return (
     <DropdownMenuSub>
       <DropdownMenuSubTrigger>
         <current.icon className="mr-2 h-4 w-4" />
-        <span>Appearance</span>
+        <span>{t.preferences.appearance}</span>
       </DropdownMenuSubTrigger>
       <DropdownMenuSubContent>
-        {options.map((o) => (
+        {THEME_OPTIONS.map((o) => (
           <DropdownMenuItem key={o.value} onClick={() => setTheme(o.value)}>
             <o.icon className="mr-2 h-4 w-4" />
-            <span>{o.label}</span>
+            <span>{t.preferences[o.labelKey]}</span>
             {theme === o.value && <Check className="ml-auto h-4 w-4" />}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  )
+}
+
+/** The console's language, next to Appearance in the account menu. */
+function LanguageSubmenu() {
+  const { locale, setLocale, t } = useI18n()
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <Languages className="mr-2 h-4 w-4" />
+        <span>{t.preferences.language}</span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        {(Object.keys(LOCALE_NAMES) as Locale[]).map((code) => (
+          <DropdownMenuItem
+            key={code}
+            lang={code}
+            onClick={() => setLocale(code)}
+          >
+            <span>{LOCALE_NAMES[code]}</span>
+            {locale === code && <Check className="ml-auto h-4 w-4" />}
           </DropdownMenuItem>
         ))}
       </DropdownMenuSubContent>
@@ -619,6 +646,7 @@ function NavUser() {
   const { user } = useAuth()
   const { isMobile, isMinimal, setOpenMobile } = useSidebar()
   const { logout } = useAuth()
+  const { t } = useI18n()
   if (!user) return null
 
   // Mobile renders inside a Radix Sheet (Dialog) with z-[9999] on the
@@ -662,8 +690,8 @@ function NavUser() {
                 await logout()
               }}
               className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-              aria-label="Log out"
-              title="Log out"
+              aria-label={t.account.logOut}
+              title={t.account.logOut}
             >
               <LogOut className="h-4 w-4" />
             </button>
@@ -733,13 +761,14 @@ function NavUser() {
               <DropdownMenuItem>
                 <Link to="/account" className="flex items-center">
                   <BadgeCheck className="mr-2 h-4 w-4" />
-                  <span>Account</span>
+                  <span>{t.account.account}</span>
                 </Link>
               </DropdownMenuItem>
-              {/* Appearance lives with the account rather than as a fourth
-                  icon in the header — it's a per-user preference you set once,
-                  not something you reach for while working. */}
+              {/* Appearance and language live with the account rather than as
+                  icons in the header: per-user preferences you set once, not
+                  something you reach for while working. */}
               <ThemeSubmenu />
+              <LanguageSubmenu />
             </DropdownMenuGroup>
             <DropdownMenuSeparator />
             <DropdownMenuItem
@@ -748,7 +777,7 @@ function NavUser() {
               }}
             >
               <LogOut />
-              Log out
+              {t.account.logOut}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

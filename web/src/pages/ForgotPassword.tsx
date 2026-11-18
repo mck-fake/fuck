@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { BrandMark } from '@/components/branding/Brand'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -19,6 +20,7 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   emailStatusOptions,
   requestPasswordResetMutation,
@@ -26,19 +28,31 @@ import {
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { AlertCircle, ArrowLeft, Loader2, MailCheck } from 'lucide-react'
+import { useMemo } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { z } from 'zod'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useI18n } from '@/components/providers/I18nProvider'
+import { AuthPreferences } from '@/components/preferences/PreferenceSwitchers'
+import { formatParts, type Messages } from '@/lib/i18n'
 
-const forgotPasswordSchema = z.object({
-  email: z.email('Please enter a valid email address'),
-})
+// Resets the admin password without email; run on the server, where the
+// installer's `temps` command already knows the database URL.
+export const RESET_ADMIN_PASSWORD_COMMAND = 'sudo temps reset-admin-password'
 
-type ForgotPasswordFormData = z.infer<typeof forgotPasswordSchema>
+// Built per language so the validation message follows the selected one.
+const forgotPasswordSchemaFor = (t: Messages) =>
+  z.object({ email: z.email(t.auth.invalidEmail) })
+
+type ForgotPasswordFormData = z.infer<
+  ReturnType<typeof forgotPasswordSchemaFor>
+>
 
 export const ForgotPassword = () => {
-  usePageTitle('Forgot password')
+  const { t } = useI18n()
+  usePageTitle(t.auth.forgot.pageTitle)
+  const forgotPasswordSchema = useMemo(() => forgotPasswordSchemaFor(t), [t])
 
   // The server only offers password reset when an email provider is
   // configured (request_password_reset returns 503 otherwise). Surface
@@ -58,7 +72,7 @@ export const ForgotPassword = () => {
   // also pre-gate the form on `resetAvailable` so it rarely fires.
   const requestReset = useMutation({
     ...requestPasswordResetMutation(),
-    meta: { errorTitle: 'Could not send reset link' },
+    meta: { errorTitle: t.auth.forgot.sendFailed },
   })
 
   const handleSubmit = async (data: ForgotPasswordFormData) => {
@@ -66,17 +80,11 @@ export const ForgotPassword = () => {
   }
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-background p-4">
+    <div className="relative flex min-h-screen flex-col items-center justify-center bg-background p-4">
+      <AuthPreferences />
       <div className="w-full max-w-sm space-y-6">
         <div className="flex flex-col items-center space-y-6">
-          <div className="flex items-center gap-3">
-            <img
-              src="/svg/temps-icon.svg"
-              alt="Temps logo"
-              className="size-12"
-            />
-            <span className="text-2xl font-bold">Temps</span>
-          </div>
+          <BrandMark />
         </div>
 
         {requestReset.isSuccess ? (
@@ -85,21 +93,24 @@ export const ForgotPassword = () => {
               <div className="mb-2 flex size-10 items-center justify-center rounded-full bg-primary/10">
                 <MailCheck className="size-5 text-primary" />
               </div>
-              <CardTitle className="text-2xl">Check your email</CardTitle>
+              <CardTitle className="text-2xl">
+                {t.auth.forgot.checkEmail}
+              </CardTitle>
               <CardDescription>
-                If an account exists for{' '}
-                <span className="font-medium text-foreground">
-                  {form.getValues('email')}
-                </span>
-                , we&apos;ve sent a link to reset your password. The link
-                expires in 1 hour.
+                {formatParts(t.auth.forgot.sent, {
+                  email: (
+                    <span key="email" className="font-medium text-foreground">
+                      {form.getValues('email')}
+                    </span>
+                  ),
+                })}
               </CardDescription>
             </CardHeader>
             <CardContent>
               <Button asChild variant="outline" className="w-full">
                 <Link to="/">
                   <ArrowLeft className="mr-2 h-4 w-4" />
-                  Back to login
+                  {t.auth.forgot.backToLogin}
                 </Link>
               </Button>
             </CardContent>
@@ -107,20 +118,27 @@ export const ForgotPassword = () => {
         ) : (
           <Card className="w-full max-w-sm">
             <CardHeader>
-              <CardTitle className="text-2xl">Forgot password?</CardTitle>
-              <CardDescription>
-                Enter your email and we&apos;ll send you a link to reset your
-                password.
-              </CardDescription>
+              <CardTitle className="text-2xl">{t.auth.forgot.title}</CardTitle>
+              <CardDescription>{t.auth.forgot.description}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               {!resetAvailable && (
                 <Alert variant="destructive">
                   <AlertCircle className="h-4 w-4" />
-                  <AlertTitle>Password reset unavailable</AlertTitle>
-                  <AlertDescription>
-                    No email provider is configured on this server, so reset
-                    links can&apos;t be sent. Contact your administrator.
+                  <AlertTitle>{t.auth.forgot.unavailableTitle}</AlertTitle>
+                  <AlertDescription className="space-y-2">
+                    <p>{t.auth.forgot.unavailable}</p>
+                    <div className="flex items-center gap-2 rounded-md bg-muted px-3 py-2 text-foreground">
+                      <code className="min-w-0 flex-1 font-mono text-xs [overflow-wrap:anywhere]">
+                        {RESET_ADMIN_PASSWORD_COMMAND}
+                      </code>
+                      <CopyButton
+                        value={RESET_ADMIN_PASSWORD_COMMAND}
+                        minimal
+                        label={t.auth.forgot.copyCommand}
+                        className="shrink-0 rounded p-1 text-muted-foreground [&_svg]:size-3.5"
+                      />
+                    </div>
                   </AlertDescription>
                 </Alert>
               )}
@@ -135,7 +153,7 @@ export const ForgotPassword = () => {
                     name="email"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>Email</FormLabel>
+                        <FormLabel>{t.auth.email}</FormLabel>
                         <FormControl>
                           <Input
                             type="email"
@@ -157,10 +175,10 @@ export const ForgotPassword = () => {
                     {requestReset.isPending ? (
                       <>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Sending...
+                        {t.auth.forgot.sending}
                       </>
                     ) : (
-                      'Send reset link'
+                      t.auth.forgot.send
                     )}
                   </Button>
                 </form>
@@ -169,7 +187,7 @@ export const ForgotPassword = () => {
               <Button asChild variant="ghost" className="w-full">
                 <Link to="/">
                   <ArrowLeft className="mr-2 h-4 w-4" />
-                  Back to login
+                  {t.auth.forgot.backToLogin}
                 </Link>
               </Button>
             </CardContent>

@@ -444,6 +444,9 @@ export function buildPlatformSettingsUpdateBody(
       // page edits it through this builder, so it must be sent for a save
       // there to take effect.
       on_demand_tls: updated.on_demand_tls,
+      // Edited on the Branding page; the server also preserves an omitted
+      // block, but that page's own save must carry it to take effect.
+      branding: updated.branding,
     }
   return body
 }

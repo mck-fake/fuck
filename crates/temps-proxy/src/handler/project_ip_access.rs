@@ -8,11 +8,15 @@
 //! (`/projects/{project_id}/environments/{environment_id}/ip-access`).
 //! Handlers only authorise, call the service and audit; validation,
 //! canonicalisation and the lock-out check live in the service.
+//!
+//! `/ip-access/default` is the instance default every project and environment
+//! without a policy of its own follows; it needs the settings permissions.
 
 use crate::ip_access::IpAccessMode;
 use crate::service::project_ip_access_service::{
-    PolicySource, ProjectIpAccessError, ProjectIpAccessResponse, ProjectIpAccessService,
-    SetProjectIpAccessRequest, TestProjectIpAccessRequest, TestProjectIpAccessResponse,
+    InstanceIpAccessDefaultResponse, PolicySource, ProjectIpAccessError, ProjectIpAccessResponse,
+    ProjectIpAccessService, SetProjectIpAccessRequest, TestProjectIpAccessRequest,
+    TestProjectIpAccessResponse,
 };
 use axum::{
     extract::{Path, State},
@@ -23,7 +27,7 @@ use axum::{
 use serde::Serialize;
 use std::net::IpAddr;
 use std::sync::Arc;
-use temps_authz::{project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
 use temps_entities::project_ip_access_rules::IpAccessCidrEntry;
@@ -168,8 +172,30 @@ macro_rules! impl_audit_operation {
     };
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct InstanceIpAccessDefaultUpdatedAudit {
+    context: IpAccessAuditContext,
+    mode: IpAccessMode,
+    cidr_count: usize,
+    cidrs: Vec<IpAccessCidrEntry>,
+    acknowledged_lockout: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InstanceIpAccessDefaultDeletedAudit {
+    context: IpAccessAuditContext,
+}
+
 impl_audit_operation!(ProjectIpAccessUpdatedAudit, "PROJECT_IP_ACCESS_UPDATED");
 impl_audit_operation!(ProjectIpAccessDeletedAudit, "PROJECT_IP_ACCESS_DELETED");
+impl_audit_operation!(
+    InstanceIpAccessDefaultUpdatedAudit,
+    "INSTANCE_IP_ACCESS_DEFAULT_UPDATED"
+);
+impl_audit_operation!(
+    InstanceIpAccessDefaultDeletedAudit,
+    "INSTANCE_IP_ACCESS_DEFAULT_DELETED"
+);
 
 fn audit_context(user_id: Option<i32>, metadata: &RequestMetadata) -> IpAccessAuditContext {
     IpAccessAuditContext {
@@ -561,10 +587,146 @@ pub async fn test_environment_ip_access(
     ))
 }
 
+// ---- instance default --------------------------------------------------
+
+/// The instance default policy plus the caller's address, for "add my IP".
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct InstanceIpAccessDefaultDetail {
+    #[serde(flatten)]
+    pub policy: InstanceIpAccessDefaultResponse,
+    #[schema(example = "203.0.113.9")]
+    pub your_ip: Option<String>,
+}
+
+fn default_detail(
+    policy: InstanceIpAccessDefaultResponse,
+    metadata: &RequestMetadata,
+) -> InstanceIpAccessDefaultDetail {
+    InstanceIpAccessDefaultDetail {
+        policy,
+        your_ip: caller_ip(metadata)
+            .map(crate::service::project_ip_access_service::normalize_ip)
+            .map(|ip| ip.to_string()),
+    }
+}
+
+/// Get the instance default IP access policy
+///
+/// Applies to every project and environment without a policy of its own.
+/// Returns `configured: false` and mode `disabled` when none is stored.
+#[utoipa::path(
+    tag = "Project IP Access",
+    get,
+    path = "/ip-access/default",
+    responses(
+        (status = 200, description = "The instance default policy", body = InstanceIpAccessDefaultDetail),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_instance_ip_access_default(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ProjectIpAccessState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+    let policy = state.service.get_default().await?;
+    Ok(Json(default_detail(policy, &metadata)))
+}
+
+/// Set the instance default IP access policy
+///
+/// Replaces the whole default. A project or environment with a policy of its
+/// own (even a disabled one) is not affected. A save that would lock out the
+/// caller's own address is refused with `409` unless `acknowledge_lockout`
+/// is `true`.
+#[utoipa::path(
+    tag = "Project IP Access",
+    put,
+    path = "/ip-access/default",
+    request_body = SetProjectIpAccessRequest,
+    responses(
+        (status = 200, description = "Default saved", body = InstanceIpAccessDefaultDetail),
+        (status = 400, description = "Invalid policy", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 409, description = "Policy would lock out the caller", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn put_instance_ip_access_default(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ProjectIpAccessState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<SetProjectIpAccessRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    let acknowledged_lockout = request.acknowledge_lockout;
+    let user_id = auth.user_id_opt();
+    let policy = state
+        .service
+        .set_default(request, caller_ip(&metadata), user_id)
+        .await?;
+    write_audit(
+        &state,
+        &InstanceIpAccessDefaultUpdatedAudit {
+            context: audit_context(user_id, &metadata),
+            mode: policy.mode,
+            cidr_count: policy.cidrs.len(),
+            cidrs: policy.cidrs.clone(),
+            acknowledged_lockout,
+        },
+    )
+    .await;
+    Ok(Json(default_detail(policy, &metadata)))
+}
+
+/// Remove the instance default IP access policy
+///
+/// Projects without a policy of their own become reachable from any address.
+#[utoipa::path(
+    tag = "Project IP Access",
+    delete,
+    path = "/ip-access/default",
+    responses(
+        (status = 204, description = "Default removed"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "No default is stored", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_instance_ip_access_default(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ProjectIpAccessState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    state.service.delete_default().await?;
+    write_audit(
+        &state,
+        &InstanceIpAccessDefaultDeletedAudit {
+            context: audit_context(auth.user_id_opt(), &metadata),
+        },
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub fn create_routes() -> axum::Router<Arc<ProjectIpAccessState>> {
     use axum::routing::{get, post};
 
     axum::Router::new()
+        .route(
+            "/ip-access/default",
+            get(get_instance_ip_access_default)
+                .put(put_instance_ip_access_default)
+                .delete(delete_instance_ip_access_default),
+        )
         .route(
             "/projects/{project_id}/ip-access",
             get(get_project_ip_access)
@@ -601,8 +763,13 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             put_environment_ip_access,
             delete_environment_ip_access,
             test_environment_ip_access,
+            get_instance_ip_access_default,
+            put_instance_ip_access_default,
+            delete_instance_ip_access_default,
         ),
         components(schemas(
+            InstanceIpAccessDefaultDetail,
+            InstanceIpAccessDefaultResponse,
             ProjectIpAccessDetail,
             ProjectIpAccessResponse,
             SetProjectIpAccessRequest,
@@ -907,7 +1074,10 @@ mod tests {
         );
     }
 
-    const ALL_ROUTES: [(&str, &str); 8] = [
+    const ALL_ROUTES: [(&str, &str); 11] = [
+        ("GET", "/ip-access/default"),
+        ("PUT", "/ip-access/default"),
+        ("DELETE", "/ip-access/default"),
         ("GET", "/projects/5/ip-access"),
         ("PUT", "/projects/5/ip-access"),
         ("DELETE", "/projects/5/ip-access"),
@@ -1051,6 +1221,11 @@ mod tests {
             .append_query_results(vec![vec![id_row(5)]])
             .append_query_results(vec![vec![id_row(9)]])
             .append_query_results(vec![no_rules()])
+            // the project-wide row, then the instance default: neither exists
+            .append_query_results(vec![no_rules()])
+            .append_query_results(vec![
+                Vec::<temps_entities::instance_ip_access_default::Model>::new(),
+            ])
             .into_connection();
         let outcome = send(
             app(
@@ -1066,6 +1241,7 @@ mod tests {
         assert_eq!(outcome.2["environment_id"], 9);
         assert_eq!(outcome.2["configured"], false);
         assert_eq!(outcome.2["mode"], "disabled");
+        assert_eq!(outcome.2["instance_default_mode"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -1092,7 +1268,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_project_is_not_found_for_every_scope() {
-        for (method, uri) in ALL_ROUTES {
+        // The instance default has no project to look up.
+        for (method, uri) in ALL_ROUTES
+            .into_iter()
+            .filter(|(_, uri)| uri.starts_with("/projects/"))
+        {
             let db = mock_db()
                 .append_query_results(vec![no_ids()])
                 .into_connection();
@@ -1400,6 +1580,113 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "Invalid IP Access Policy",
         );
+    }
+
+    fn default_row(
+        mode: &str,
+        cidrs: &[&str],
+    ) -> temps_entities::instance_ip_access_default::Model {
+        let now = chrono::Utc::now();
+        temps_entities::instance_ip_access_default::Model {
+            id: 1,
+            mode: mode.to_string(),
+            cidrs: IpAccessCidrs(
+                cidrs
+                    .iter()
+                    .map(|cidr| IpAccessCidrEntry {
+                        cidr: cidr.to_string(),
+                        description: None,
+                    })
+                    .collect(),
+            ),
+            updated_by: Some(1),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_instance_default_needs_the_settings_permission_not_project_access() {
+        // A regular user may edit their projects' lists, never the default
+        // every project falls back to.
+        let audit = Arc::new(RecordingAudit::default());
+        let outcome = send(
+            app(
+                mock_db().into_connection(),
+                Some(session(Role::User)),
+                None,
+                audit.clone(),
+            ),
+            request_for("PUT", "/ip-access/default"),
+        )
+        .await;
+        assert_problem(&outcome, StatusCode::FORBIDDEN, "Insufficient Permissions");
+        assert!(audit.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_instance_default_saves_and_audits_it() {
+        let db = mock_db()
+            .append_query_results(vec![vec![default_row("deny", &["198.51.100.0/24"])]])
+            .into_connection();
+        let audit = Arc::new(RecordingAudit::default());
+        let outcome = send(
+            app(db, Some(session(Role::Admin)), None, audit.clone()),
+            request_for("PUT", "/ip-access/default"),
+        )
+        .await;
+        assert_eq!(outcome.0, StatusCode::OK, "body: {}", outcome.2);
+        assert_eq!(outcome.2["configured"], true);
+        assert_eq!(outcome.2["mode"], "deny");
+        assert_eq!(outcome.2["your_ip"], CALLER_IP);
+        let recorded = audit.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "INSTANCE_IP_ACCESS_DEFAULT_UPDATED");
+        assert!(recorded[0].1.contains("198.51.100.0/24"));
+    }
+
+    #[tokio::test]
+    async fn get_instance_default_without_a_row_is_unconfigured() {
+        let db = mock_db()
+            .append_query_results(vec![
+                Vec::<temps_entities::instance_ip_access_default::Model>::new(),
+            ])
+            .into_connection();
+        let outcome = send(
+            app(
+                db,
+                Some(session(Role::Admin)),
+                None,
+                Arc::new(RecordingAudit::default()),
+            ),
+            empty_request(Method::GET, "/ip-access/default"),
+        )
+        .await;
+        assert_eq!(outcome.0, StatusCode::OK, "body: {}", outcome.2);
+        assert_eq!(outcome.2["configured"], false);
+        assert_eq!(outcome.2["mode"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn delete_instance_default_without_a_row_is_not_found_and_not_audited() {
+        let db = mock_db()
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+        let audit = Arc::new(RecordingAudit::default());
+        let outcome = send(
+            app(db, Some(session(Role::Admin)), None, audit.clone()),
+            empty_request(Method::DELETE, "/ip-access/default"),
+        )
+        .await;
+        assert_problem(
+            &outcome,
+            StatusCode::NOT_FOUND,
+            "IP Access Policy Not Found",
+        );
+        assert!(audit.recorded().is_empty());
     }
 
     #[test]

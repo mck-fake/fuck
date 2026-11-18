@@ -5,20 +5,23 @@
 //!
 //! Handlers authorise (`edge_rules:read` / `edge_rules:write`, narrowed to
 //! the project), call the service and audit. Every change is enforced by the
-//! proxies within seconds of the response: there are no drafts.
+//! proxies within seconds of the response: there are no drafts. Every change
+//! is also kept as a numbered revision of the whole rule set, which can be
+//! listed, inspected and restored (`/edge-rules/revisions`).
 
 use crate::service::edge_rule_service::{
-    CreateEdgeRuleRequest, EdgeRuleListResponse, EdgeRuleResponse, EdgeRuleService,
+    CreateEdgeRuleRequest, EdgeRuleListResponse, EdgeRuleResponse, EdgeRuleRevisionListResponse,
+    EdgeRuleRevisionResponse, EdgeRuleRevisionRule, EdgeRuleRevisionSummary, EdgeRuleService,
     EdgeRuleServiceError, EvaluateEdgeRulesRequest, EvaluateEdgeRulesResponse, EvaluateRuleInput,
     EvaluateTraceEntry, ReorderEdgeRulesRequest, UpdateEdgeRuleRequest,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Extension, Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_authz::{project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
@@ -78,6 +81,16 @@ impl From<EdgeRuleServiceError> for Problem {
                     .with_title("Unreadable Edge Rule")
                     .with_detail(error.to_string())
             }
+            EdgeRuleServiceError::RevisionNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Edge Rule Revision Not Found")
+                    .with_detail(error.to_string())
+            }
+            EdgeRuleServiceError::UnreadableRevision { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Edge Rule Revision Cannot Be Restored")
+                    .with_detail(error.to_string())
+            }
             EdgeRuleServiceError::Database { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -126,6 +139,14 @@ struct EdgeRulesReorderedAudit {
     rule_ids: Vec<i32>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct EdgeRulesRestoredAudit {
+    context: EdgeRuleAuditContext,
+    project_id: i32,
+    restored_revision: i32,
+    rule_ids: Vec<i32>,
+}
+
 macro_rules! impl_audit_operation {
     ($ty:ty, $name:literal) => {
         impl AuditOperation for $ty {
@@ -157,6 +178,7 @@ impl_audit_operation!(EdgeRuleCreatedAudit, "EDGE_RULE_CREATED");
 impl_audit_operation!(EdgeRuleUpdatedAudit, "EDGE_RULE_UPDATED");
 impl_audit_operation!(EdgeRuleDeletedAudit, "EDGE_RULE_DELETED");
 impl_audit_operation!(EdgeRulesReorderedAudit, "EDGE_RULES_REORDERED");
+impl_audit_operation!(EdgeRulesRestoredAudit, "EDGE_RULES_RESTORED");
 
 fn audit_context(user_id: Option<i32>, metadata: &RequestMetadata) -> EdgeRuleAuditContext {
     EdgeRuleAuditContext {
@@ -381,7 +403,10 @@ pub async fn delete_edge_rule(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
-    let rule = state.service.delete(project_id, rule_id, None).await?;
+    let rule = state
+        .service
+        .delete(project_id, rule_id, None, auth.user_id_opt())
+        .await?;
     write_audit(
         &state,
         &EdgeRuleDeletedAudit {
@@ -428,7 +453,10 @@ pub async fn reorder_edge_rules(
     );
     project_scope_guard!(auth, project_id);
     let rule_ids = request.rule_ids.clone();
-    let list = state.service.reorder(project_id, request).await?;
+    let list = state
+        .service
+        .reorder(project_id, request, auth.user_id_opt())
+        .await?;
     write_audit(
         &state,
         &EdgeRulesReorderedAudit {
@@ -477,6 +505,150 @@ pub async fn evaluate_edge_rules(
     Ok(Json(state.service.evaluate(project_id, request).await?))
 }
 
+/// Page of the revision history (default 20 per page, at most 100).
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct EdgeRuleRevisionsQuery {
+    #[serde(default = "first_page")]
+    pub page: u64,
+    #[serde(default = "default_per_page")]
+    pub per_page: u64,
+}
+
+fn first_page() -> u64 {
+    1
+}
+
+fn default_per_page() -> u64 {
+    20
+}
+
+/// List the revisions of a project's edge rules
+///
+/// Every change to the rules is kept as a numbered revision of the whole rule
+/// set, newest first. The last 100 are kept.
+#[utoipa::path(
+    tag = "Edge Rules",
+    get,
+    path = "/projects/{project_id}/edge-rules/revisions",
+    params(("project_id" = i32, Path, description = "Project ID"), EdgeRuleRevisionsQuery),
+    responses(
+        (status = 200, description = "A page of revisions, newest first", body = EdgeRuleRevisionListResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Project not found", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_edge_rule_revisions(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<EdgeRulesState>>,
+    Path(project_id): Path<i32>,
+    Query(query): Query<EdgeRuleRevisionsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        EdgeRulesRead,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
+    Ok(Json(
+        state
+            .service
+            .list_revisions(project_id, query.page, query.per_page)
+            .await?,
+    ))
+}
+
+/// Get one revision of a project's edge rules
+#[utoipa::path(
+    tag = "Edge Rules",
+    get,
+    path = "/projects/{project_id}/edge-rules/revisions/{number}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("number" = i32, Path, description = "Revision number")
+    ),
+    responses(
+        (status = 200, description = "The revision with its whole rule set", body = EdgeRuleRevisionResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Project or revision not found", body = ProblemDetails),
+        (status = 409, description = "The revision is stored in a form this version cannot read", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_edge_rule_revision(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<EdgeRulesState>>,
+    Path((project_id, number)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        EdgeRulesRead,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
+    Ok(Json(state.service.get_revision(project_id, number).await?))
+}
+
+/// Restore a revision of a project's edge rules
+///
+/// Puts the rules back as they were in that revision and records the restore
+/// as a new revision. Rules added since are removed. Enforced by every proxy
+/// within seconds.
+#[utoipa::path(
+    tag = "Edge Rules",
+    post,
+    path = "/projects/{project_id}/edge-rules/revisions/{number}/restore",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("number" = i32, Path, description = "Revision number")
+    ),
+    responses(
+        (status = 200, description = "The rules now in force", body = EdgeRuleListResponse),
+        (status = 400, description = "A rule of the revision is no longer valid", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Project, revision or an environment it names not found", body = ProblemDetails),
+        (status = 409, description = "The revision cannot be restored", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn restore_edge_rule_revision(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<EdgeRulesState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, number)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        EdgeRulesWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
+    let list = state
+        .service
+        .restore(project_id, number, auth.user_id_opt())
+        .await?;
+    write_audit(
+        &state,
+        &EdgeRulesRestoredAudit {
+            context: audit_context(auth.user_id_opt(), &metadata),
+            project_id,
+            restored_revision: number,
+            rule_ids: list.rules.iter().map(|r| r.id).collect(),
+        },
+    )
+    .await;
+    Ok(Json(list))
+}
+
 pub fn create_routes() -> axum::Router<Arc<EdgeRulesState>> {
     use axum::routing::{get, post, put};
 
@@ -492,6 +664,18 @@ pub fn create_routes() -> axum::Router<Arc<EdgeRulesState>> {
         .route(
             "/projects/{project_id}/edge-rules/evaluate",
             post(evaluate_edge_rules),
+        )
+        .route(
+            "/projects/{project_id}/edge-rules/revisions",
+            get(list_edge_rule_revisions),
+        )
+        .route(
+            "/projects/{project_id}/edge-rules/revisions/{number}",
+            get(get_edge_rule_revision),
+        )
+        .route(
+            "/projects/{project_id}/edge-rules/revisions/{number}/restore",
+            post(restore_edge_rule_revision),
         )
         .route(
             "/projects/{project_id}/edge-rules/{rule_id}",
@@ -514,8 +698,15 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             delete_edge_rule,
             reorder_edge_rules,
             evaluate_edge_rules,
+            list_edge_rule_revisions,
+            get_edge_rule_revision,
+            restore_edge_rule_revision,
         ),
         components(schemas(
+            EdgeRuleRevisionListResponse,
+            EdgeRuleRevisionResponse,
+            EdgeRuleRevisionRule,
+            EdgeRuleRevisionSummary,
             EdgeRuleListResponse,
             EdgeRuleResponse,
             CreateEdgeRuleRequest,
@@ -734,6 +925,115 @@ mod tests {
             })
             .status_code,
             StatusCode::CONFLICT
+        );
+        assert_eq!(
+            Problem::from(EdgeRuleServiceError::RevisionNotFound {
+                project_id: 3,
+                number: 9
+            })
+            .status_code,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            Problem::from(EdgeRuleServiceError::UnreadableRevision {
+                project_id: 3,
+                number: 9,
+                reason: "bad".into()
+            })
+            .status_code,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn revisions_are_listed_by_readers_and_restored_by_writers_with_an_audit() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project_id, _) = project(&test_db, "edge-routes-history").await;
+        sea_orm::ConnectionTrait::execute_unprepared(
+            db.as_ref(),
+            "INSERT INTO users (id, name, email, created_at, updated_at) VALUES \
+             (1, 'Test User', 'user1@example.test', now(), now()) ON CONFLICT DO NOTHING",
+        )
+        .await
+        .expect("seed the acting user");
+        let audit = Arc::new(RecordingAudit::default());
+        let admin = AuthContext::new_session(user(), Role::Admin);
+        let reader = AuthContext::new_session(user(), Role::Reader);
+        let base = format!("/projects/{project_id}/edge-rules");
+
+        let (status, created) = send(
+            app(db.clone(), Some(admin.clone()), audit.clone()),
+            request(Method::POST, &base, Some(block_admin())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {created}");
+        let id = created["id"].as_i64().unwrap_or_default();
+        let (status, _) = send(
+            app(db.clone(), Some(admin.clone()), audit.clone()),
+            request(Method::DELETE, &format!("{base}/{id}"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = send(
+            app(db.clone(), None, audit.clone()),
+            request(Method::GET, &format!("{base}/revisions"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, history) = send(
+            app(db.clone(), Some(reader.clone()), audit.clone()),
+            request(Method::GET, &format!("{base}/revisions?per_page=1"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {history}");
+        assert_eq!(history["total"], 2);
+        assert_eq!(history["per_page"], 1);
+        assert_eq!(history["revisions"][0]["number"], 2);
+        assert_eq!(history["revisions"][0]["created_by_name"], "Test User");
+
+        let (status, one) = send(
+            app(db.clone(), Some(reader.clone()), audit.clone()),
+            request(Method::GET, &format!("{base}/revisions/1"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {one}");
+        assert_eq!(one["rules"][0]["id"], id);
+
+        let restore = format!("{base}/revisions/1/restore");
+        let (status, refused) = send(
+            app(db.clone(), Some(reader), audit.clone()),
+            request(Method::POST, &restore, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {refused}");
+        let (status, missing) = send(
+            app(db.clone(), Some(admin.clone()), audit.clone()),
+            request(Method::POST, &format!("{base}/revisions/42/restore"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {missing}");
+        assert_eq!(missing["title"], "Edge Rule Revision Not Found");
+
+        let (status, restored) = send(
+            app(db.clone(), Some(admin), audit.clone()),
+            request(Method::POST, &restore, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {restored}");
+        assert_eq!(restored["rules"][0]["id"], id);
+        let names: Vec<String> = audit.recorded().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            [
+                "EDGE_RULE_CREATED",
+                "EDGE_RULE_DELETED",
+                "EDGE_RULES_RESTORED"
+            ],
+            "reads and refused writes are not audited"
         );
     }
 

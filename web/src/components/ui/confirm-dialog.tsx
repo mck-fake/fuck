@@ -13,6 +13,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { buttonVariants } from '@/components/ui/button'
+import { useI18n } from '@/components/providers/I18nProvider'
 import { cn } from '@/lib/utils'
 
 /**
@@ -27,7 +28,7 @@ export function ConfirmDialog({
   onOpenChange,
   title,
   description,
-  confirmLabel = 'Delete',
+  confirmLabel,
   destructive = true,
   onConfirm,
 }: {
@@ -39,6 +40,7 @@ export function ConfirmDialog({
   destructive?: boolean
   onConfirm: () => void
 }) {
+  const { t } = useI18n()
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent>
@@ -47,14 +49,14 @@ export function ConfirmDialog({
           <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogCancel>{t.common.cancel}</AlertDialogCancel>
           <AlertDialogAction
             className={cn(
               destructive && buttonVariants({ variant: 'destructive' })
             )}
             onClick={onConfirm}
           >
-            {confirmLabel}
+            {confirmLabel ?? t.common.delete}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

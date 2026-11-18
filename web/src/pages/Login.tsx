@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { BrandMark } from '@/components/branding/Brand'
 import { LoginForm } from '@/components/auth/login-form'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -15,61 +16,25 @@ import { useNavigate, useSearchParams } from 'react-router'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { consumeReturnTo, goToReturnTo } from '@/lib/return-to'
+import { useI18n } from '@/components/providers/I18nProvider'
+import { AuthPreferences } from '@/components/preferences/PreferenceSwitchers'
+import type { Messages } from '@/lib/i18n'
 
 /**
  * Maps opaque SSO error codes (from `login_error_code_for` in
  * `oidc_handler.rs`) to user-facing messages. Server returns codes
  * instead of raw IdP text so we don't leak IdP error descriptions
  * into the browser URL / history / Referer. Unknown codes fall
- * through to a generic message.
+ * through to a generic message. The texts live in `auth.oidcErrors`.
  */
-const OIDC_ERROR_MESSAGES: Record<string, string> = {
-  idp_error:
-    'Your identity provider rejected the login. Check that your account is allowed.',
-  idp_unreachable:
-    "We couldn't reach your identity provider. Try again in a moment.",
-  idp_rejected_code:
-    'Your identity provider rejected the authorization code. Try signing in again.',
-  state_invalid:
-    'This SSO link is invalid or has already been used. Start sign-in again.',
-  state_expired: 'This SSO link expired. Start sign-in again.',
-  id_token_invalid:
-    'Your identity provider returned an invalid token. Contact your administrator.',
-  callback_invalid: 'The SSO callback was malformed. Start sign-in again.',
-  email_missing:
-    'Your identity provider did not return an email address. Grant the "email" scope and try again.',
-  email_not_verified:
-    'Your identity provider has not confirmed your email. Verify it at the IdP, then try again.',
-  user_not_provisioned:
-    'No Temps account exists for this email. Ask an administrator to create one.',
-  provider_disabled: 'This SSO provider is currently disabled.',
-  credentials_changed:
-    'Your password was reset by an administrator while you were signing in. Start sign-in again.',
-  provider_not_found: 'The SSO provider configuration was not found.',
-  no_provider_configured:
-    'No SSO provider is configured on this Temps instance.',
-  issuer_invalid: 'The SSO provider URL is invalid.',
-  return_to_invalid: 'Invalid post-login redirect target.',
-  role_invalid: 'The role assigned by the SSO provider is invalid.',
-  role_mapping_not_found: 'No matching SSO role mapping.',
-  provider_conflict: 'SSO provider configuration conflict.',
-  provider_managed_by_cloud:
-    'This SSO provider is managed by Temps Cloud and cannot be edited here.',
-  insufficient_role:
-    "Your Temps Cloud account doesn't have the owner or admin role on this instance. Ask an instance owner or admin to grant it, then try again.",
-  issuer_managed_by_cloud:
-    'This issuer is already used by the Temps Cloud-managed sign-in provider. Use "Continue with Temps Cloud" to sign in, or remove the Cloud link before adding a custom provider with this issuer.',
-  internal_error:
-    'An internal error occurred while processing the SSO callback.',
-}
-
-function oidcErrorMessage(reason: string | null): string {
-  if (!reason) return 'SSO sign-in failed.'
-  return OIDC_ERROR_MESSAGES[reason] ?? 'SSO sign-in failed.'
+function oidcErrorMessage(t: Messages, reason: string | null): string {
+  const messages: Record<string, string> = t.auth.oidcErrors
+  return (reason && messages[reason]) || t.auth.ssoFailed
 }
 
 export const Login = () => {
-  usePageTitle('Login')
+  const { t } = useI18n()
+  usePageTitle(t.auth.loginPageTitle)
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { refetch } = useAuth()
@@ -87,13 +52,13 @@ export const Login = () => {
     // Referer. Translate each known code into a user-facing message
     // here; unknown values fall through to a generic string.
     const reason = searchParams.get('reason')
-    return oidcErrorMessage(reason)
-  }, [searchParams])
+    return oidcErrorMessage(t, reason)
+  }, [searchParams, t])
 
   const login = useMutation({
     ...loginMutation(),
     meta: {
-      errorTitle: 'Login failed',
+      errorTitle: t.auth.loginFailed,
     },
     onSuccess: async (data) => {
       if (data.password_change_required) {
@@ -102,13 +67,13 @@ export const Login = () => {
       }
 
       if (data.mfa_required) {
-        toast.success('Please complete MFA verification')
+        toast.success(t.auth.completeMfa)
         navigate('/mfa-verify')
         return
       }
 
       if (data.mfa_enrollment_required && data.mfa_setup) {
-        toast.success('Set up multi-factor authentication to continue')
+        toast.success(t.auth.setUpMfa)
         navigate('/auth/change-password', {
           replace: true,
           state: { mfaSetup: data.mfa_setup },
@@ -116,7 +81,7 @@ export const Login = () => {
         return
       }
 
-      toast.success('Logged in successfully')
+      toast.success(t.auth.loggedIn)
       await queryClient.invalidateQueries({ queryKey: ['getCurrentUser'] })
       await refetch()
       goToReturnTo(navigate, consumeReturnTo('/dashboard'))
@@ -131,23 +96,17 @@ export const Login = () => {
   }
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-background p-4">
+    <div className="relative flex min-h-screen flex-col items-center justify-center bg-background p-4">
+      <AuthPreferences />
       <div className="w-full max-w-sm space-y-6">
         <div className="flex flex-col items-center space-y-6">
-          <div className="flex items-center gap-3">
-            <img
-              src="/svg/temps-icon.svg"
-              alt="Temps logo"
-              className="size-12"
-            />
-            <span className="text-2xl font-bold">Temps</span>
-          </div>
+          <BrandMark />
           <div className="flex flex-col space-y-2 text-center">
             <h1 className="text-2xl font-semibold tracking-tight">
-              Welcome back
+              {t.auth.welcomeBack}
             </h1>
             <p className="text-sm text-muted-foreground">
-              Sign in to your account to continue
+              {t.auth.signInToContinue}
             </p>
           </div>
         </div>
@@ -155,7 +114,7 @@ export const Login = () => {
         {oidcError && (
           <Alert variant="destructive">
             <AlertCircle className="h-4 w-4" />
-            <AlertTitle>SSO sign-in failed</AlertTitle>
+            <AlertTitle>{t.auth.ssoFailedTitle}</AlertTitle>
             <AlertDescription>{oidcError}</AlertDescription>
           </Alert>
         )}
@@ -164,9 +123,7 @@ export const Login = () => {
           onSubmit={handleSubmit}
           isLoading={login.isPending}
           oidcProviders={emailStatus?.oidc_providers ?? []}
-          passwordResetAvailable={
-            emailStatus?.password_reset_available ?? false
-          }
+          passwordLoginEnabled={emailStatus?.password_login_enabled ?? true}
         />
       </div>
     </div>

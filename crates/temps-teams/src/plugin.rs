@@ -29,6 +29,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::checker::TeamProjectAccessChecker;
+use crate::custom_roles::{CustomRoleResolver, CustomRoleService};
 use crate::handlers::{router, TeamsApiDoc, TeamsAppState};
 use crate::service::{DefaultTeamService, TeamService};
 
@@ -74,12 +75,21 @@ impl TempsPlugin for TeamsPlugin {
             let sensitive_action_authorizer =
                 context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
 
+            let custom_roles = Arc::new(CustomRoleService::new(db.clone(), checker.clone()));
             let app_state = Arc::new(TeamsAppState::new(
                 team_service,
                 audit,
                 checker.clone(),
                 sensitive_action_authorizer,
+                custom_roles,
             ));
+
+            // Custom roles answer the membership resolver that
+            // `configure_routes` attaches to the checker. A plugin that
+            // registers its own resolver later replaces this one.
+            let resolver: Arc<dyn temps_core::MembershipPermissionResolver> =
+                Arc::new(CustomRoleResolver::new(db.clone()));
+            context.register_service(resolver);
             context.register_service(app_state);
 
             // Registering this activates `project_access_guard!` and

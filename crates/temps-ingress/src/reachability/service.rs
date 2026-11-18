@@ -43,9 +43,9 @@ use temps_domains::DomainService;
 use temps_entities::audience::via;
 use temps_entities::{
     deployment_containers, dns_managed_record_states, domains, environment_domains, environments,
-    ingress_connectors, node_public_ingress, nodes, project_custom_domains,
-    project_ip_access_rules, projects, reachability_plans, reachability_runs,
-    tailnet_serve_entries, teams, users,
+    ingress_connectors, instance_ip_access_default, node_public_ingress, nodes,
+    project_custom_domains, project_ip_access_rules, projects, reachability_plans,
+    reachability_runs, tailnet_serve_entries, teams, users,
 };
 use temps_projects::CustomDomainService;
 use thiserror::Error;
@@ -3163,11 +3163,21 @@ pub async fn private_rule(
             "the project's",
         ),
     };
-    let Some(row) = row else {
-        return Ok(None);
+    // No row of its own: the instance default governs, as in the proxy's gate.
+    let (mode, entries, whose) = match row {
+        Some(row) => (row.mode.clone(), row.cidrs.0.clone(), whose),
+        None => match instance_ip_access_default::Entity::find_by_id(
+            instance_ip_access_default::SINGLETON_ID,
+        )
+        .one(db)
+        .await?
+        {
+            Some(default) => (default.mode, default.cidrs.0, "the instance default"),
+            None => return Ok(None),
+        },
     };
-    let cidrs: Vec<String> = row.cidrs.0.iter().map(|e| e.cidr.clone()).collect();
-    if row.mode != "allow" || !only_private(&cidrs) {
+    let cidrs: Vec<String> = entries.iter().map(|e| e.cidr.clone()).collect();
+    if mode != "allow" || !only_private(&cidrs) {
         return Ok(None);
     }
     Ok(Some(PrivateAllowList {

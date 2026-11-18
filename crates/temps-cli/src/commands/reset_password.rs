@@ -47,12 +47,15 @@ struct MfaClearOutcome {
     admin_mfa_requirement_disabled: bool,
 }
 
-/// Turn off `require_mfa_for_admins` if it is on, returning whether it was.
+/// Turn off a boolean login-blocking setting if it is on, returning whether it was.
 ///
-/// While it is on, password sign-in for an admin without MFA is refused, so
-/// clearing the only admin's factor would still leave them locked out.
-async fn disable_admin_mfa_requirement<C: sea_orm::ConnectionTrait>(
+/// `require_mfa_for_admins` refuses password sign-in for an admin without MFA,
+/// and `password_login_disabled` refuses every password sign-in, so either one
+/// left on would keep the reset admin locked out.
+async fn turn_off_login_block<C: sea_orm::ConnectionTrait>(
     conn: &C,
+    key: &str,
+    is_on: fn(&temps_config::AppSettings) -> bool,
 ) -> anyhow::Result<bool> {
     let Some(settings) = temps_entities::settings::Entity::find_by_id(1)
         .one(conn)
@@ -60,34 +63,33 @@ async fn disable_admin_mfa_requirement<C: sea_orm::ConnectionTrait>(
     else {
         return Ok(false);
     };
-    if !temps_config::AppSettings::from_json(settings.data.clone()).require_mfa_for_admins {
+    if !is_on(&temps_config::AppSettings::from_json(settings.data.clone())) {
         return Ok(false);
     }
 
     let mut data = settings.data.clone();
     let Some(object) = data.as_object_mut() else {
         return Err(anyhow::anyhow!(
-            "Settings row 1 is not a JSON object; cannot turn off require_mfa_for_admins"
+            "Settings row 1 is not a JSON object; cannot turn off {key}"
         ));
     };
-    object.insert(
-        "require_mfa_for_admins".to_string(),
-        serde_json::Value::Bool(false),
-    );
+    object.insert(key.to_string(), serde_json::Value::Bool(false));
     let mut update: temps_entities::settings::ActiveModel = settings.into();
     update.data = Set(data);
     update.update(conn).await?;
     Ok(true)
 }
 
-/// Set `user_id`'s password hash and, with `clear_mfa`, remove their second
-/// factor, in one transaction.
+/// Set `user_id`'s password hash, turn password sign-in back on if the
+/// instance was SSO only and, with `clear_mfa`, remove their second factor,
+/// in one transaction. Returns the MFA outcome and whether password sign-in
+/// was re-enabled.
 async fn apply_admin_reset(
     conn: &sea_orm::DatabaseConnection,
     user_id: i32,
     password_hash: String,
     clear_mfa: bool,
-) -> anyhow::Result<Option<MfaClearOutcome>> {
+) -> anyhow::Result<(Option<MfaClearOutcome>, bool)> {
     let transaction = conn.begin().await?;
     // Same row lock every second-factor check takes.
     let user = users::Entity::find_by_id(user_id)
@@ -103,7 +105,11 @@ async fn apply_admin_reset(
     let outcome = if clear_mfa {
         let had_mfa = user.mfa_enabled;
         let cleared = temps_auth::clear_mfa_enrollment(&transaction, user).await?;
-        let admin_mfa_requirement_disabled = disable_admin_mfa_requirement(&transaction).await?;
+        let admin_mfa_requirement_disabled =
+            turn_off_login_block(&transaction, "require_mfa_for_admins", |s| {
+                s.require_mfa_for_admins
+            })
+            .await?;
         Some(MfaClearOutcome {
             had_mfa,
             sessions_revoked: cleared.sessions_revoked,
@@ -112,9 +118,23 @@ async fn apply_admin_reset(
     } else {
         None
     };
+    let password_login_reenabled =
+        turn_off_login_block(&transaction, "password_login_disabled", |s| {
+            s.password_login_disabled
+        })
+        .await?;
 
     transaction.commit().await?;
-    Ok(outcome)
+    Ok((outcome, password_login_reenabled))
+}
+
+fn print_password_login_reenabled() {
+    println!(
+        "{}",
+        "⚠️  Password sign-in was turned off (SSO only) and has been turned back on, otherwise this password could not be used. Turn it off again in Settings › Authentication once SSO works."
+            .bright_yellow()
+            .bold()
+    );
 }
 
 fn print_mfa_outcome(outcome: &MfaClearOutcome) {
@@ -203,7 +223,14 @@ async fn reset_admin_password(
         .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
         .to_string();
 
-    let mfa_outcome = apply_admin_reset(conn, user.id, password_hash, clear_mfa).await?;
+    let (mfa_outcome, password_login_reenabled) =
+        apply_admin_reset(conn, user.id, password_hash, clear_mfa).await?;
+    if password_login_reenabled {
+        info!(
+            "Re-enabled password sign-in while resetting admin user {}",
+            user.id
+        );
+    }
     if let Some(outcome) = &mfa_outcome {
         info!(
             "Cleared MFA for admin user {} ({} session(s) revoked, admin MFA requirement disabled: {})",
@@ -226,6 +253,9 @@ async fn reset_admin_password(
         );
         if let Some(outcome) = &mfa_outcome {
             print_mfa_outcome(outcome);
+        }
+        if password_login_reenabled {
+            print_password_login_reenabled();
         }
         println!();
         debug!("Reset admin password for user: {}", user.email);
@@ -260,6 +290,9 @@ async fn reset_admin_password(
     );
     if let Some(outcome) = &mfa_outcome {
         print_mfa_outcome(outcome);
+    }
+    if password_login_reenabled {
+        print_password_login_reenabled();
     }
     println!();
     println!(
@@ -437,10 +470,12 @@ mod tests {
         let db = test_db.db.as_ref();
         let admin = locked_out_admin(db).await;
 
-        let outcome = apply_admin_reset(db, admin.id, "new-hash".to_string(), true)
-            .await
-            .unwrap()
-            .expect("--clear-mfa reports what it changed");
+        let (outcome, password_login_reenabled) =
+            apply_admin_reset(db, admin.id, "new-hash".to_string(), true)
+                .await
+                .unwrap();
+        let outcome = outcome.expect("--clear-mfa reports what it changed");
+        assert!(!password_login_reenabled, "password sign-in was never off");
         assert!(outcome.had_mfa);
         assert_eq!(outcome.sessions_revoked, 1);
         assert!(outcome.admin_mfa_requirement_disabled);
@@ -483,7 +518,7 @@ mod tests {
         let db = test_db.db.as_ref();
         let admin = locked_out_admin(db).await;
 
-        let outcome = apply_admin_reset(db, admin.id, "new-hash".to_string(), false)
+        let (outcome, _) = apply_admin_reset(db, admin.id, "new-hash".to_string(), false)
             .await
             .unwrap();
         assert!(outcome.is_none());
@@ -505,5 +540,38 @@ mod tests {
             1
         );
         assert_eq!(settings_data(db).await["require_mfa_for_admins"], true);
+    }
+
+    /// A reset password is useless while the instance is SSO only, so the
+    /// break-glass reset always turns password sign-in back on.
+    #[tokio::test]
+    async fn reset_turns_password_sign_in_back_on_for_an_sso_only_instance() {
+        let Some(test_db) = test_db().await else {
+            return;
+        };
+        let db = test_db.db.as_ref();
+        let admin = locked_out_admin(db).await;
+        let mut data = settings_data(db).await;
+        data["password_login_disabled"] = serde_json::Value::Bool(true);
+        temps_entities::settings::ActiveModel {
+            id: Set(1),
+            data: Set(data),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .unwrap();
+
+        let (_, password_login_reenabled) =
+            apply_admin_reset(db, admin.id, "new-hash".to_string(), false)
+                .await
+                .unwrap();
+        assert!(password_login_reenabled);
+        let settings = settings_data(db).await;
+        assert_eq!(settings["password_login_disabled"], false);
+        assert_eq!(
+            settings["require_mfa_for_admins"], true,
+            "without --clear-mfa the MFA requirement is kept"
+        );
     }
 }

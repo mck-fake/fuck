@@ -4,5 +4,5 @@
 mod handler;
 pub mod plugin;
 
-pub use handler::{configure_routes, SettingsApiDoc, SettingsState};
+pub use handler::{configure_public_routes, configure_routes, SettingsApiDoc, SettingsState};
 pub use plugin::ConfigPlugin;

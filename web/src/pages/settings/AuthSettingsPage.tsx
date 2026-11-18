@@ -3,9 +3,12 @@
 
 import {
   deleteOidcProviderMutation,
+  getSettingsOptions,
+  getSettingsQueryKey,
   listOidcProvidersOptions,
   listOidcProvidersQueryKey,
   updateOidcProviderMutation,
+  updateSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { OidcProviderResponse } from '@/api/client/types.gen'
 import { problemMessage } from '@/components/settings/oidc-provider-constants'
@@ -45,6 +48,7 @@ import {
   KeyRound,
   Lock,
   Plus,
+  ShieldCheck,
   Trash2,
 } from 'lucide-react'
 import type { ComponentType, SVGProps } from 'react'
@@ -91,6 +95,93 @@ function formatTemplate(template?: string): string {
  */
 const MANAGED_BY_CLOUD_TOOLTIP =
   'Managed by Temps Cloud. Turn off "Console access through Temps Cloud" on the Temps Cloud settings page to remove it.'
+
+/** Why the "Require SSO" switch is in its state, or `null` when nothing needs saying. */
+export function ssoOnlyNotice(
+  ssoOnly: boolean,
+  hasEnabledProvider: boolean
+): string | null {
+  if (ssoOnly && !hasEnabledProvider) {
+    return 'No SSO provider is enabled, so nobody can sign in. Enable a provider or turn passwords back on.'
+  }
+  if (!ssoOnly && !hasEnabledProvider) {
+    return 'Enable an SSO provider first: with none, nobody could sign in.'
+  }
+  return null
+}
+
+function RequireSsoCard({
+  hasEnabledProvider,
+  onSensitiveError,
+}: {
+  hasEnabledProvider: boolean
+  onSensitiveError: (error: unknown, retry: () => void) => boolean
+}) {
+  const queryClient = useQueryClient()
+  const settingsQuery = useQuery(getSettingsOptions())
+  const ssoOnly = settingsQuery.data?.password_login_disabled ?? false
+  const update = useMutation({
+    ...updateSettingsMutation(),
+    onSuccess: async (_data, variables) => {
+      toast.success(
+        variables.body.password_login_disabled
+          ? 'Sign-in is now SSO only'
+          : 'Password sign-in is turned back on'
+      )
+      await queryClient.invalidateQueries({ queryKey: getSettingsQueryKey() })
+    },
+    onError: (error, variables) => {
+      if (onSensitiveError(error, () => update.mutate(variables))) return
+      toast.error(problemMessage(error, 'Failed to change password sign-in'))
+    },
+  })
+  const notice = ssoOnlyNotice(ssoOnly, hasEnabledProvider)
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <ShieldCheck className="h-5 w-5" />
+          Require SSO
+        </CardTitle>
+        <CardDescription>
+          Recover with <code>sudo temps reset-admin-password</code> on the
+          server; it turns passwords back on.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex items-start justify-between gap-4">
+        <p
+          className={
+            ssoOnly && !hasEnabledProvider
+              ? 'text-sm text-destructive'
+              : 'text-sm text-muted-foreground'
+          }
+        >
+          {notice ??
+            (ssoOnly
+              ? 'Only SSO providers can sign in.'
+              : 'Passwords and SSO both work.')}
+        </p>
+        {settingsQuery.isLoading ? (
+          <Skeleton className="h-5 w-9 shrink-0 rounded-full" />
+        ) : (
+          <Switch
+            checked={ssoOnly}
+            disabled={
+              update.isPending ||
+              settingsQuery.isError ||
+              (!ssoOnly && !hasEnabledProvider)
+            }
+            onCheckedChange={(checked) =>
+              update.mutate({ body: { password_login_disabled: checked } })
+            }
+            aria-label="Require SSO and turn off password sign-in"
+          />
+        )}
+      </CardContent>
+    </Card>
+  )
+}
 
 export function AuthSettingsPage() {
   usePageTitle('Authentication')
@@ -354,6 +445,13 @@ export function AuthSettingsPage() {
             )
           })}
         </div>
+      )}
+
+      {!providersUnknown && !providersQuery.isLoading && (
+        <RequireSsoCard
+          hasEnabledProvider={providers.some((provider) => provider.enabled)}
+          onSensitiveError={handleSensitiveActionError}
+        />
       )}
 
       <ConfirmDeleteDialog

@@ -54,6 +54,15 @@
 //!   proxy keeps enforcing what it last knew; it never reverts to open.
 //! * The gate is only consulted once a project/environment has been resolved,
 //!   so the console and its API are never subject to a project's rules.
+//!
+//! # Instance default
+//!
+//! `instance_ip_access_default` (at most one row) governs every scope with no
+//! row of its own: an environment override wins, then the project-wide row
+//! (even a `disabled` one, which is how a project opts out), then the
+//! default. Each poll reads that one row by primary key and republishes only
+//! when its `updated_at` moved. Its initial read must succeed like the rules';
+//! a later failure keeps the last default it loaded.
 
 use super::cidr_set::{parse_cidr, CidrSet};
 use super::IpAccessMode;
@@ -67,8 +76,9 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use temps_core::ProjectIpGate;
-use temps_entities::project_ip_access_rules;
+use temps_core::{DBDateTime, ProjectIpGate};
+use temps_entities::project_ip_access_rules::IpAccessCidrEntry;
+use temps_entities::{instance_ip_access_default, project_ip_access_rules};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -106,6 +116,9 @@ struct Policy {
 struct ProjectPolicies {
     /// Project-wide policy, if one is active.
     project: Option<Arc<Policy>>,
+    /// A project-wide row exists, even a `disabled` one: the project does not
+    /// fall back to the instance default.
+    project_recorded: bool,
     /// Environment overrides sorted by environment id. `None` is an explicit
     /// "unrestricted", which exempts the environment from `project`.
     environments: Vec<(i32, Option<Arc<Policy>>)>,
@@ -118,12 +131,15 @@ impl ProjectPolicies {
     /// record: it exempts the environment from a project-wide list that may be
     /// saved later, so a project holding one is not inert.
     fn is_inert(&self) -> bool {
-        self.project.is_none() && self.environments.is_empty()
+        !self.project_recorded && self.environments.is_empty()
     }
 
     fn set_scope(&mut self, environment_id: Option<i32>, policy: Option<Arc<Policy>>) {
         match environment_id {
-            None => self.project = policy,
+            None => {
+                self.project = policy;
+                self.project_recorded = true;
+            }
             Some(id) => match self.environments.binary_search_by_key(&id, |(env, _)| *env) {
                 Ok(index) => self.environments[index].1 = policy,
                 Err(index) => self.environments.insert(index, (id, policy)),
@@ -133,7 +149,10 @@ impl ProjectPolicies {
 
     fn remove_scope(&mut self, environment_id: Option<i32>) {
         match environment_id {
-            None => self.project = None,
+            None => {
+                self.project = None;
+                self.project_recorded = false;
+            }
             Some(id) => self.environments.retain(|(env, _)| *env != id),
         }
     }
@@ -142,6 +161,11 @@ impl ProjectPolicies {
 #[derive(Debug, Default)]
 struct Snapshot {
     projects: HashMap<i32, Arc<ProjectPolicies>>,
+    /// The instance default, for scopes with no row of their own.
+    default: Option<Arc<Policy>>,
+    /// `updated_at` of the default row this snapshot holds, `None` when there
+    /// is no row: a poll republishes only when it differs.
+    default_stamp: Option<DBDateTime>,
 }
 
 /// A scope whose rule was deleted.
@@ -161,15 +185,29 @@ struct TombstoneRow {
 
 impl Snapshot {
     /// The policy that governs `environment_id`: its own override when one
-    /// exists (even an explicit "unrestricted"), otherwise the project's.
+    /// exists (even an explicit "unrestricted"), otherwise the project's when
+    /// the project has a row (even a `disabled` one), otherwise the instance
+    /// default.
     fn effective(&self, project_id: i32, environment_id: i32) -> Option<&Policy> {
-        let scopes = self.projects.get(&project_id)?;
+        let Some(scopes) = self.projects.get(&project_id) else {
+            return self.default.as_deref();
+        };
         match scopes
             .environments
             .binary_search_by_key(&environment_id, |(id, _)| *id)
         {
             Ok(index) => scopes.environments[index].1.as_deref(),
-            Err(_) => scopes.project.as_deref(),
+            Err(_) if scopes.project_recorded => scopes.project.as_deref(),
+            Err(_) => self.default.as_deref(),
+        }
+    }
+
+    /// The same rules with another instance default.
+    fn with_default(&self, default: Option<Arc<Policy>>, stamp: Option<DBDateTime>) -> Snapshot {
+        Snapshot {
+            projects: self.projects.clone(),
+            default,
+            default_stamp: stamp,
         }
     }
 
@@ -201,7 +239,11 @@ impl Snapshot {
                 projects.remove(&row.project_id);
             }
         }
-        Snapshot { projects }
+        Snapshot {
+            projects,
+            default: self.default.clone(),
+            default_stamp: self.default_stamp,
+        }
     }
 }
 
@@ -260,7 +302,9 @@ impl ProjectIpAccessGate {
 
     pub async fn hydrate(&self) -> Result<(), IpAccessGateError> {
         match self.refresh(true).await {
-            Ok(_) => Ok(()),
+            Ok(_) => self.refresh_default().await.map(|_| ()),
+            // The default's table is newer than the rules' table, so it is
+            // missing too: nothing to read.
             Err(IpAccessGateError::Database { source, .. }) if is_missing_table(&source) => {
                 warn!(
                     "project_ip_access_rules does not exist yet (migration pending); \
@@ -270,6 +314,56 @@ impl ProjectIpAccessGate {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// One poll: the rules' change feed, then the instance default.
+    async fn poll(&self, force_full: bool) -> Result<Refresh, IpAccessGateError> {
+        let outcome = self.refresh(force_full).await?;
+        self.refresh_default().await?;
+        Ok(outcome)
+    }
+
+    /// Read the instance default row (one primary-key read) and republish the
+    /// snapshot when it changed. Returns whether it did. A missing table is a
+    /// pending migration and means no default.
+    async fn refresh_default(&self) -> Result<bool, IpAccessGateError> {
+        let row = match instance_ip_access_default::Entity::find_by_id(
+            instance_ip_access_default::SINGLETON_ID,
+        )
+        .one(self.db.as_ref())
+        .await
+        {
+            Ok(row) => row,
+            Err(source)
+                if source.to_string().contains("instance_ip_access_default")
+                    && source.to_string().contains("does not exist") =>
+            {
+                None
+            }
+            Err(source) => {
+                return Err(IpAccessGateError::Database {
+                    operation: "load the instance default of",
+                    source,
+                })
+            }
+        };
+        let stamp = row.as_ref().map(|row| row.updated_at);
+        let current = self.snapshot.load();
+        if current.default_stamp == stamp {
+            return Ok(false);
+        }
+        let policy = row
+            .as_ref()
+            .and_then(|row| compile_entries(&row.mode, &row.cidrs.0, "the instance default"))
+            .map(Arc::new);
+        info!(
+            mode = row.as_ref().map(|row| row.mode.as_str()).unwrap_or("none"),
+            enforced = policy.is_some(),
+            "Instance default IP access policy updated"
+        );
+        self.snapshot
+            .store(Arc::new(current.with_default(policy, stamp)));
+        Ok(true)
     }
 
     /// Build a hydrated gate and start its refresh loop on `handle`'s runtime.
@@ -305,7 +399,7 @@ impl ProjectIpAccessGate {
             // Poll first: the startup load may already be a poll behind.
             let force_full = last_full_reload.elapsed() >= FULL_RELOAD_INTERVAL
                 || last_success.elapsed() >= STALE_AFTER;
-            match self.refresh(force_full).await {
+            match self.poll(force_full).await {
                 Ok(outcome) => {
                     last_success = Instant::now();
                     if consecutive_failures > 0 {
@@ -434,8 +528,11 @@ impl ProjectIpAccessGate {
             // drawn a revision but not committed is not in `rows`, and must be
             // found by the next delta.
             let seen = rows.iter().map(|row| row.revision).max().unwrap_or(0);
-            self.snapshot
-                .store(Arc::new(Snapshot::default().patched(&[], &rows)));
+            let current = self.snapshot.load();
+            let rebuilt = Snapshot::default().patched(&[], &rows);
+            self.snapshot.store(Arc::new(
+                rebuilt.with_default(current.default.clone(), current.default_stamp),
+            ));
             self.applied_revision.store(seen, Ordering::Release);
             debug!(
                 rules,
@@ -507,17 +604,23 @@ fn deny_everyone() -> Policy {
 ///   bad) would silently open the scope -- so the scope refuses everyone
 ///   until the entry is fixed.
 fn compile_policy(row: &project_ip_access_rules::Model) -> Option<Policy> {
-    let mode = match IpAccessMode::parse(&row.mode) {
+    let scope = format!(
+        "rule {} (project {}, environment {:?})",
+        row.id, row.project_id, row.environment_id
+    );
+    compile_entries(&row.mode, &row.cidrs.0, &scope)
+}
+
+/// Compile a stored mode and entry list; `scope` labels the log lines.
+fn compile_entries(mode: &str, cidrs: &[IpAccessCidrEntry], scope: &str) -> Option<Policy> {
+    let mode = match IpAccessMode::parse(mode) {
         Some(mode) => mode,
         None => {
             // The CHECK constraint makes this unreachable. Fail closed for the
             // scope rather than silently treating it as open.
             error!(
-                rule_id = row.id,
-                project_id = row.project_id,
-                environment_id = ?row.environment_id,
-                mode = %row.mode,
-                "Unknown IP access mode; denying all traffic for this scope"
+                scope,
+                mode, "Unknown IP access mode; denying all traffic for this scope"
             );
             return Some(deny_everyone());
         }
@@ -526,20 +629,18 @@ fn compile_policy(row: &project_ip_access_rules::Model) -> Option<Policy> {
         return None;
     }
 
-    let mut networks = Vec::with_capacity(row.cidrs.0.len());
+    let mut networks = Vec::with_capacity(cidrs.len());
     let mut unparsable = 0usize;
-    for entry in &row.cidrs.0 {
+    for entry in cidrs {
         match parse_cidr(&entry.cidr) {
             Ok(network) => networks.push(network),
             Err(e) => {
                 unparsable += 1;
                 error!(
-                    rule_id = row.id,
-                    project_id = row.project_id,
-                    environment_id = ?row.environment_id,
+                    scope,
                     cidr = %entry.cidr,
                     error = %e,
-                    "Unparsable CIDR in project IP access rule"
+                    "Unparsable CIDR in IP access policy"
                 );
             }
         }
@@ -548,11 +649,8 @@ fn compile_policy(row: &project_ip_access_rules::Model) -> Option<Policy> {
     if mode == IpAccessMode::Deny {
         if unparsable > 0 {
             error!(
-                rule_id = row.id,
-                project_id = row.project_id,
-                environment_id = ?row.environment_id,
-                unparsable,
-                "Deny list has unreadable entries; denying all traffic for this scope"
+                scope,
+                unparsable, "Deny list has unreadable entries; denying all traffic for this scope"
             );
             return Some(deny_everyone());
         }
@@ -743,7 +841,8 @@ mod tests {
         assert!(!gate.has_active_policy(7, 70));
         assert!(gate.is_allowed(8, 80, ip("203.0.113.1")));
         assert!(!gate.has_active_policy(8, 80));
-        assert!(gate.snapshot.load().projects.is_empty());
+        // Both rows are kept: they opt their projects out of the instance default.
+        assert_eq!(gate.snapshot.load().projects.len(), 2);
     }
 
     #[test]
@@ -909,8 +1008,11 @@ mod tests {
             &[],
         );
         assert!(removed.projects.is_empty());
+        // A disabled project row enforces nothing but is kept: it is the
+        // project's opt-out from the instance default.
         let disabled = before.patched(&[], &[row(1, 7, None, "disabled", &[])]);
-        assert!(disabled.projects.is_empty());
+        assert_eq!(disabled.projects.len(), 1);
+        assert!(disabled.effective(7, 70).is_none());
     }
 
     #[test]
@@ -976,6 +1078,7 @@ mod tests {
             // hydrate: head, then rows
             .append_query_results(vec![vec![revision_row(4)]])
             .append_query_results(vec![vec![row(4, 7, None, "allow", &["10.0.0.0/8"])]])
+            .append_query_results(vec![no_default()])
             // poll: head only
             .append_query_results(vec![vec![revision_row(4)]])
             .into_connection();
@@ -992,8 +1095,8 @@ mod tests {
             .into_transaction_log();
         assert_eq!(
             log.len(),
-            3,
-            "head + rows at startup, head only on the poll"
+            4,
+            "head + rows + default at startup, head only on the poll"
         );
     }
 
@@ -1003,6 +1106,7 @@ mod tests {
             sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![revision_row(1)]])
                 .append_query_results(vec![vec![row(1, 7, None, "allow", &["10.0.0.0/8"])]])
+                .append_query_results(vec![no_default()])
                 .append_query_results(vec![vec![revision_row(3)]])
                 .append_query_results(vec![vec![removed_row(3, 7, Some(70))]])
                 .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
@@ -1054,6 +1158,7 @@ mod tests {
                 row(1, 7, None, "allow", &["10.0.0.0/8"]),
                 row(2, 8, None, "allow", &["192.168.0.0/16"]),
             ]])
+            .append_query_results(vec![no_default()])
             // poll: head moved; tombstones, then changed rows
             .append_query_results(vec![vec![revision_row(5)]])
             .append_query_results(vec![vec![removed_row(4, 8, None)]])
@@ -1084,6 +1189,7 @@ mod tests {
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![revision_row(1)]])
             .append_query_results(vec![vec![row(1, 7, None, "allow", &["10.0.0.0/8"])]])
+            .append_query_results(vec![no_default()])
             .append_query_results(vec![vec![revision_row(3)]])
             .append_query_errors(vec![sea_orm::DbErr::Custom("connection lost".into())])
             .into_connection();
@@ -1103,6 +1209,7 @@ mod tests {
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![revision_row(7)]])
             .append_query_results(vec![vec![row(5, 7, None, "allow", &["10.0.0.0/8"])]])
+            .append_query_results(vec![no_default()])
             // poll 1: head still 7, nothing above 5 is committed yet
             .append_query_results(vec![vec![revision_row(7)]])
             .append_query_results(vec![no_tombstones()])
@@ -1141,6 +1248,7 @@ mod tests {
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![revision_row(9)]])
             .append_query_results(vec![vec![row(9, 7, None, "allow", &["10.0.0.0/8"])]])
+            .append_query_results(vec![no_default()])
             .append_query_results(vec![vec![revision_row(2)]])
             .append_query_results(vec![vec![row(2, 8, None, "allow", &["192.168.0.0/16"])]])
             .into_connection();
@@ -1161,6 +1269,7 @@ mod tests {
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![revision_row(1)]])
             .append_query_results(vec![vec![row(1, 7, None, "allow", &["10.0.0.0/8"])]])
+            .append_query_results(vec![no_default()])
             .into_connection();
         let gate = ProjectIpAccessGate::new(Arc::new(db));
         assert!(gate.is_allowed(7, 70, ip("203.0.113.1")));
@@ -1177,6 +1286,163 @@ mod tests {
             .await
             .expect("a pending migration means no rules, not a failed start");
         assert!(gate.is_allowed(7, 70, ip("203.0.113.1")));
+    }
+
+    fn no_default() -> Vec<instance_ip_access_default::Model> {
+        Vec::new()
+    }
+
+    fn default_row(mode: &str, cidrs: &[&str], second: u32) -> instance_ip_access_default::Model {
+        use chrono::TimeZone;
+        let at = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 17, 12, 0, second)
+            .single()
+            .expect("valid timestamp");
+        instance_ip_access_default::Model {
+            id: 1,
+            mode: mode.to_string(),
+            cidrs: project_ip_access_rules::IpAccessCidrs(
+                cidrs
+                    .iter()
+                    .map(|cidr| IpAccessCidrEntry {
+                        cidr: (*cidr).to_string(),
+                        description: None,
+                    })
+                    .collect(),
+            ),
+            updated_by: None,
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    fn with_default(snapshot: Snapshot, row: &instance_ip_access_default::Model) -> Snapshot {
+        let policy = compile_entries(&row.mode, &row.cidrs.0, "test").map(Arc::new);
+        snapshot.with_default(policy, Some(row.updated_at))
+    }
+
+    #[test]
+    fn the_instance_default_governs_only_scopes_without_a_row_of_their_own() {
+        let rules = Snapshot::default().patched(
+            &[],
+            &[
+                // Project 7 has its own list; project 8 opted out with a
+                // disabled row; project 9 exempts one environment only.
+                row(1, 7, None, "allow", &["192.168.0.0/16"]),
+                row(2, 8, None, "disabled", &[]),
+                row(3, 9, Some(91), "disabled", &[]),
+            ],
+        );
+        let snapshot = with_default(rules, &default_row("allow", &["10.0.0.0/8"], 0));
+        let allowed = |project, env, addr| {
+            snapshot
+                .effective(project, env)
+                .is_none_or(|policy| match policy.mode {
+                    IpAccessMode::Allow => policy.set.contains(ip(addr)),
+                    IpAccessMode::Deny => !policy.set.contains(ip(addr)),
+                    IpAccessMode::Disabled => true,
+                })
+        };
+        // A project with no row at all follows the default.
+        assert!(allowed(5, 50, "10.1.1.1"));
+        assert!(!allowed(5, 50, "203.0.113.1"));
+        // Its own list wins over the default.
+        assert!(allowed(7, 70, "192.168.1.1"));
+        assert!(!allowed(7, 70, "10.1.1.1"));
+        // A disabled project row is an opt-out.
+        assert!(allowed(8, 80, "203.0.113.1"));
+        // An exempted environment is open; its siblings follow the default.
+        assert!(allowed(9, 91, "203.0.113.1"));
+        assert!(!allowed(9, 90, "203.0.113.1"));
+    }
+
+    #[test]
+    fn a_disabled_or_empty_deny_default_enforces_nothing() {
+        for row in [
+            default_row("disabled", &["10.0.0.0/8"], 0),
+            default_row("deny", &[], 0),
+        ] {
+            let snapshot = with_default(Snapshot::default(), &row);
+            assert!(snapshot.effective(5, 50).is_none(), "{}", row.mode);
+        }
+    }
+
+    #[test]
+    fn rule_patches_keep_the_instance_default() {
+        let snapshot = with_default(
+            Snapshot::default(),
+            &default_row("deny", &["203.0.113.0/24"], 0),
+        );
+        let patched = snapshot.patched(&[], &[row(1, 7, None, "allow", &["10.0.0.0/8"])]);
+        assert!(
+            patched.effective(5, 50).is_some(),
+            "the default survives a patch"
+        );
+        assert_eq!(patched.default_stamp, snapshot.default_stamp);
+    }
+
+    #[tokio::test]
+    async fn the_default_is_republished_only_when_its_row_changes() {
+        let first = default_row("allow", &["10.0.0.0/8"], 0);
+        let edited = default_row("allow", &["172.16.0.0/12"], 1);
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![first.clone()]])
+            .append_query_results(vec![vec![first]])
+            .append_query_results(vec![vec![edited]])
+            .append_query_results(vec![no_default()])
+            .into_connection();
+        let gate = ProjectIpAccessGate::new(Arc::new(db));
+
+        assert!(gate.refresh_default().await.expect("first read"));
+        assert!(!gate.is_allowed(5, 50, ip("172.16.1.1")));
+        assert!(
+            !gate.refresh_default().await.expect("same row"),
+            "unchanged"
+        );
+        assert!(gate.refresh_default().await.expect("edited row"));
+        assert!(gate.is_allowed(5, 50, ip("172.16.1.1")));
+        assert!(!gate.is_allowed(5, 50, ip("10.1.1.1")));
+        assert!(gate.refresh_default().await.expect("row deleted"));
+        assert!(
+            gate.is_allowed(5, 50, ip("10.1.1.1")),
+            "no default, no restriction"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_default_read_keeps_the_last_default_and_fails_startup() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![default_row("allow", &["10.0.0.0/8"], 0)]])
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection lost".into())])
+            .into_connection();
+        let gate = ProjectIpAccessGate::new(Arc::new(db));
+        gate.refresh_default().await.expect("first read");
+        assert!(gate.refresh_default().await.is_err());
+        assert!(!gate.is_allowed(5, 50, ip("203.0.113.1")), "still enforced");
+
+        // At startup the same failure aborts instead of serving with no default.
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![revision_row(0)]])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection lost".into())])
+            .into_connection();
+        let gate = ProjectIpAccessGate::new(Arc::new(db));
+        assert!(gate.hydrate().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_missing_default_table_means_no_default() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "relation \"instance_ip_access_default\" does not exist".into(),
+            )])
+            .into_connection();
+        let gate = ProjectIpAccessGate::new(Arc::new(db));
+        assert!(!gate
+            .refresh_default()
+            .await
+            .expect("pending migration is no default"));
+        assert!(gate.is_allowed(5, 50, ip("203.0.113.1")));
     }
 
     fn missing_table_db() -> DatabaseConnection {
