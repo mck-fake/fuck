@@ -143,7 +143,7 @@ release_tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?
 # The repository whose releases this installs: the fork's own, so an install
 # or upgrade never swaps the fork for upstream Temps. TEMPS_RELEASE_REPO
 # (owner/name) overrides it, e.g. for installer tests before the fork's first release.
-release_repo=${TEMPS_RELEASE_REPO:-mck-fake/fuck}
+release_repo=${TEMPS_RELEASE_REPO:-mck-fake/temps}
 [[ $release_repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || error "TEMPS_RELEASE_REPO must be owner/name, got: $release_repo"
 
 # Print the highest of the tags read from stdin (one per line) by semver

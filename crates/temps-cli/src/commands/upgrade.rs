@@ -13,7 +13,7 @@ use tracing::{debug, info};
 
 /// The fork's own releases: `temps upgrade` and the console's self-update must
 /// never replace this fork with an upstream Temps binary.
-const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/mck-fake/fuck/releases";
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/mck-fake/temps/releases";
 
 /// Default base URL of the Temps Cloud license + EE binary proxy. The EE
 /// binary lives in a private repo and is only reachable through this
@@ -2837,7 +2837,7 @@ mod tests {
         // every upgrade replace this fork with upstream Temps.
         assert_eq!(
             GITHUB_RELEASES_API,
-            "https://api.github.com/repos/mck-fake/fuck/releases"
+            "https://api.github.com/repos/mck-fake/temps/releases"
         );
     }
 

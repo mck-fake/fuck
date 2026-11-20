@@ -41,7 +41,7 @@ host switches environment only through `--uninstall` and a new install.
 
 | | `production` (default) | `development` |
 |---|---|---|
-| Binary | The fork's release from GitHub (`mck-fake/CloudTemps`), SHA-256 verified (`beta` unless `--version`/`--channel`); `--source checkout` builds this checkout instead | Built from this checkout with the repository `Dockerfile` (`artifacts-source`, `fast` profile) |
+| Binary | The fork's release from GitHub (`mck-fake/temps`), SHA-256 verified (`beta` unless `--version`/`--channel`); `--source checkout` builds this checkout instead | Built from this checkout with the repository `Dockerfile` (`artifacts-source`, `fast` profile) |
 | Network | Public `:80/:443`, TLS on demand, your domain or `<ip>.sslip.io` (`--mode local` for loopback) | Loopback only, `127-0-0-1.sslip.io`, no domain question |
 | Logs | `info` | `debug` |
 | `--upgrade` | Next release, with DB backup and automatic rollback | Rebuilds your changes (BuildKit cache) with the same backup and rollback |
