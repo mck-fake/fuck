@@ -25,6 +25,7 @@ them.
 | You want to | Run |
 |---|---|
 | Run a public server on the verified release | `sudo scripts/install.sh` and answer **production** |
+| Run a public server on your fork's code before it has a release | `sudo scripts/install.sh --source checkout` (builds this checkout on the server) |
 | Run your fork's code on your own machine, isolated from anything else there | `scripts/devbox.sh up` (Docker only: no sudo, Rust or Bun) |
 | Run your fork's code as a local service on a dedicated host | `sudo scripts/install.sh --env development` |
 | Hot-reload while editing Rust or the console | `scripts/dev-check.sh`, then the [start-temps](../start-temps/SKILL.md) skill |
@@ -40,7 +41,7 @@ host switches environment only through `--uninstall` and a new install.
 
 | | `production` (default) | `development` |
 |---|---|---|
-| Binary | Release from GitHub, SHA-256 verified (`beta` unless `--version`/`--channel`) | Built from this checkout with the repository `Dockerfile` (`artifacts-source`, `fast` profile) |
+| Binary | The fork's release from GitHub (`mck-fake/fuck`), SHA-256 verified (`beta` unless `--version`/`--channel`); `--source checkout` builds this checkout instead | Built from this checkout with the repository `Dockerfile` (`artifacts-source`, `fast` profile) |
 | Network | Public `:80/:443`, TLS on demand, your domain or `<ip>.sslip.io` (`--mode local` for loopback) | Loopback only, `127-0-0-1.sslip.io`, no domain question |
 | Logs | `info` | `debug` |
 | `--upgrade` | Next release, with DB backup and automatic rollback | Rebuilds your changes (BuildKit cache) with the same backup and rollback |
@@ -140,7 +141,16 @@ On the first run it asks, in this order:
    `*.example.com` at the server.
 
 `--mode local` binds everything to loopback and uses `127-0-0-1.sslip.io`
-without asking. A re-run asks nothing and keeps every secret.
+without asking. A re-run asks nothing and keeps every secret. It refuses a
+different `--mode` or `--domain` than the first install chose: the domain and
+TLS were set for that mode.
+
+Releases come from the fork's repository (`release_repo` in
+`scripts/install.sh`, overridable with `TEMPS_RELEASE_REPO=owner/name`). The
+same repository feeds `temps upgrade` and the console's self-update
+(`GITHUB_RELEASES_API` in `crates/temps-cli/src/commands/upgrade.rs`), so an
+update never replaces the fork with upstream Temps. Until the fork publishes
+its first release, use `--source checkout`.
 
 | Flag (for unattended runs) | Effect |
 |---|---|
@@ -150,6 +160,7 @@ without asking. A re-run asks nothing and keeps every secret.
 | `--domain example.com` | Your domain; without it, the sslip.io fallback |
 | `--mode public` (default) / `--mode local` | Public `:80/:443` with on-demand TLS, or loopback only |
 | `--version vX.Y.Z` / `--channel stable\|beta\|nightly` | Production only: version for the first install (defaults to `beta`, like `deploy.sh`) or for `--upgrade` |
+| `--source release` (default) / `--source checkout` | Production only: the fork's published release, or this checkout built in Docker on the server (about 8 GB RAM, slow first build). Remembered, so `--upgrade` rebuilds; `--upgrade --source ...` switches it |
 | `--check` | Preflight only; changes nothing |
 | `--upgrade` | Back up the database, install the new binary, roll back on its own if it is not healthy within 120s |
 | `--uninstall` | Remove the service, binary, CLI and database container; keep the data |
@@ -240,7 +251,9 @@ also has three security gaps:
 ```
 
 It boots a privileged Ubuntu 24.04 systemd container with its own Docker
-daemon. It answers the questions through a real terminal, then asserts:
+daemon. The production scenario installs and upgrades between two published
+releases; they come from upstream (`TEMPS_RELEASE_REPO=gotempsh/temps`) until the
+fork publishes its own. It answers the questions through a real terminal, then asserts:
 
 - the input gates: invalid email, weak password, no password without a
   terminal, a foreign `temps.service`, and the sslip.io domain fallback;

@@ -89,9 +89,12 @@ cmd_up() {
     docker exec -i "$BOX" sh -c 'umask 077; cat > /root/admin-password' <"$password_file"
     args+=(--password-file /root/admin-password)
   fi
+  local status=0
   # shellcheck disable=SC2086 # INSTALL is "bash <path>" on purpose
-  docker exec $(exec_flags) "$BOX" $INSTALL --env development "${args[@]}"
+  docker exec $(exec_flags) "$BOX" $INSTALL --env development "${args[@]}" || status=$?
+  # Removed on failure too: the password must not outlive the install.
   docker exec "$BOX" rm -f /root/admin-password
+  ((status == 0)) || exit "$status"
   cmd_status
 }
 

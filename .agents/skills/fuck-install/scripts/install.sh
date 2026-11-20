@@ -10,11 +10,13 @@
 #   sudo install.sh                    # asks environment, email, password, names, domain
 #   sudo install.sh --env development  # builds this checkout in Docker, loopback, debug logs
 #   sudo install.sh --mode local       # production binary, loopback only
+#   sudo install.sh --source checkout  # production built from this checkout (the fork's code)
 #   sudo install.sh --check            # read-only preflight
 #   sudo install.sh --upgrade          # DB backup, new binary (or rebuild), automatic rollback
 #   sudo install.sh --uninstall        # removes service and binary, keeps data (--purge deletes it)
 #   unattended: --env --email --first-name --last-name --password-file [--domain]
 #               [--version vX.Y.Z | --channel stable|beta|nightly]   (production)
+#               [--source release|checkout]   (production; development always builds)
 #
 # Without a domain, Enter takes <public-ip>.sslip.io (a .io wildcard DNS name).
 # Run it from a repository checkout: production reuses scripts/install.sh for
@@ -48,10 +50,10 @@ DB_IMAGE=timescale/timescaledb-ha:pg18
 CONSOLE_ADDR=127.0.0.1:8081
 
 env="" mode="" mode_flag="" domain_flag="" email="" first_name="" last_name="" password=""
-password_file="" version="" channel="" check_only=false upgrade=false uninstall=false purge=false
+password_file="" version="" channel="" source_flag="" check_only=false upgrade=false uninstall=false purge=false
 fails=0
 
-usage() { sed -n '5,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '5,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 step() { printf '==> %s\n' "$*"; }
 ok() { printf '  ok    %s\n' "$*"; }
@@ -72,6 +74,7 @@ while (($#)); do
     --mode) need "$@"; mode_flag=$2; shift 2 ;;
     --version) need "$@"; version=$2; shift 2 ;;
     --channel) need "$@"; channel=$2; shift 2 ;;
+    --source) need "$@"; source_flag=$2; shift 2 ;;
     --check) check_only=true; shift ;;
     --upgrade) upgrade=true; shift ;;
     --uninstall) uninstall=true; shift ;;
@@ -96,8 +99,12 @@ valid_password() {
 saved() { [[ -r $CONF ]] && sed -n "s/^$1=//p" "$CONF" | head -1 || true; }
 saved_domain=$(saved domain)
 saved_env=$(saved env)
+saved_mode=$(saved mode)
 env=${env:-$saved_env}
-mode=${mode_flag:-$(saved mode)}
+mode=${mode_flag:-$saved_mode}
+# Where the binary comes from: the published release, or this checkout built in
+# Docker. Remembered, so --upgrade keeps building the fork's own code.
+source=${source_flag:-$(saved source)}
 domain=${domain_flag:-$saved_domain}
 email=${email:-$(saved email)}
 
@@ -110,6 +117,7 @@ email=${email:-$(saved email)}
 [[ -z $domain_flag ]] || valid_domain "$domain_flag" || die "invalid --domain"
 [[ -z $version || $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.]+)?$ ]] || die "invalid --version (expected vX.Y.Z)"
 [[ -z $channel || $channel =~ ^(stable|beta|nightly)$ ]] || die "--channel must be stable, beta or nightly"
+[[ -z $source_flag || $source_flag == release || $source_flag == checkout ]] || die "--source must be release or checkout"
 [[ -z $version || -z $channel ]] || die "pass --version or --channel, not both"
 $uninstall || ! $purge || die "--purge only goes with --uninstall"
 ! { $upgrade && $uninstall; } || die "pass --upgrade or --uninstall, not both"
@@ -118,6 +126,11 @@ if [[ -x $PREFIX/bin/temps && (-n $version || -n $channel) ]] && ! $upgrade; the
 fi
 if [[ -n $saved_domain && -n $domain_flag && $domain_flag != "$saved_domain" ]]; then
   die "domain was set to $saved_domain at install time; change it in the console (Settings > Domains)"
+fi
+# A re-run must not silently expose a loopback install (no certificate, loopback
+# domain) on 0.0.0.0, or hide a public one: the domain and TLS follow the mode.
+if [[ -n $saved_mode && -n $mode_flag && $mode_flag != "$saved_mode" ]]; then
+  die "this host was installed in $saved_mode mode; switching it to $mode_flag needs a new install (its domain and TLS were set for $saved_mode)"
 fi
 
 preflight() {
@@ -131,7 +144,9 @@ preflight() {
   esac
   local glibc
   glibc=$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' || true)
-  if [[ -n $glibc ]] && printf '2.35\n%s\n' "$glibc" | sort -V -C; then
+  if [[ $source == checkout ]]; then
+    ok "built from this checkout (static binary; glibc not needed)"
+  elif [[ -n $glibc ]] && printf '2.35\n%s\n' "$glibc" | sort -V -C; then
     ok "glibc $glibc"
   else
     fail "glibc >= 2.35 is required by the release binary (found ${glibc:-none})"
@@ -151,18 +166,18 @@ preflight() {
   for c in curl openssl ss awk sed; do command -v "$c" >/dev/null || missing+=("$c"); done
   ((${#missing[@]} == 0)) && ok "tools present" || fail "missing commands: ${missing[*]}"
 
-  if [[ $env == development ]]; then
+  if [[ $source == checkout ]]; then
     if ((mem_mb >= 7500)); then ok "enough RAM to build the checkout"
     else warn "${mem_mb} MB RAM: building the checkout wants about 8 GB and may run out of memory"; fi
     [[ -f $REPO_ROOT/Dockerfile ]] && ok "Dockerfile found for the development build" ||
-      fail "no Dockerfile in $REPO_ROOT: development builds need the full checkout"
+      fail "no Dockerfile in $REPO_ROOT: building the checkout needs the full repository"
   fi
 
   if command -v docker >/dev/null; then
     ok "docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,)"
     docker compose version >/dev/null 2>&1 ||
       warn "docker compose plugin missing: Compose deployments will not work until it is installed"
-    if [[ $env == development ]] && ! docker buildx version >/dev/null 2>&1; then
+    if [[ $source == checkout ]] && ! docker buildx version >/dev/null 2>&1; then
       command -v apt-get >/dev/null && warn "docker buildx missing: the distro package docker-buildx will be installed" ||
         fail "docker buildx is missing and there is no apt-get to install it"
     fi
@@ -261,8 +276,13 @@ choose_env() {
     [[ $mode_flag != public ]] || die "development installs stay on loopback: drop --mode public"
     [[ -z $domain_flag ]] || die "development installs use 127-0-0-1.sslip.io: drop --domain"
     [[ -z $version && -z $channel ]] || die "development builds this checkout: --version and --channel are for production"
+    [[ $source_flag != release ]] || die "development always builds this checkout: drop --source release"
     mode=local
+    source=checkout
   fi
+  source=${source:-release}
+  [[ $source == release || -z $version && -z $channel ]] ||
+    die "--source checkout builds this checkout: --version and --channel pick a published release"
   mode=${mode:-public}
   [[ -z $domain_flag || $mode == public ]] || die "--domain needs --mode public"
   local bind=0.0.0.0
@@ -308,7 +328,7 @@ ensure_docker() {
   # nft lets the platform block workload egress to cloud metadata.
   command -v nft >/dev/null || pkgs+=(nftables)
   # The development build exports the binary with `docker build --output`, which needs BuildKit.
-  if [[ $env == development ]] && ! docker buildx version >/dev/null 2>&1; then pkgs+=(docker-buildx); fi
+  if [[ $source == checkout ]] && ! docker buildx version >/dev/null 2>&1; then pkgs+=(docker-buildx); fi
   if ((${#pkgs[@]})) && command -v apt-get >/dev/null; then
     step "Installing distro packages: ${pkgs[*]}"
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
@@ -333,7 +353,7 @@ ensure_layout() {
   install -d -m 0750 -o "$BRAND" -g "$BRAND" "$DATA" "$DATA/data"
   install -d -m 0700 "$ETC"
   touch "$MARKER"
-  printf 'env=%s\nmode=%s\ndomain=%s\nemail=%s\n' "$env" "$mode" "$domain" "$email" |
+  printf 'env=%s\nmode=%s\nsource=%s\ndomain=%s\nemail=%s\n' "$env" "$mode" "$source" "$domain" "$email" |
     write_if_changed "$CONF" 0600 || true
 }
 
@@ -371,7 +391,7 @@ ensure_db() {
 install_binary() {
   install -d -m 0755 "$PREFIX/bin"
   rm -rf "$PREFIX/staging"
-  if [[ $env == development ]]; then build_from_source; else download_release; fi
+  if [[ $source == checkout ]]; then build_from_source; else download_release; fi
   rm -rf "$PREFIX/staging"
   write_cli
 }
@@ -481,6 +501,8 @@ upgrade() {
   old=$("$PREFIX/bin/temps" --version 2>/dev/null | head -1 || true)
   old=${old:-the previous binary}
   ensure_docker
+  # Records a --source change, so later upgrades keep the same binary source.
+  ensure_layout
   docker start "$DB_CONTAINER" >/dev/null
   install -d -m 0700 "$DATA/backups"
   backup=$DATA/backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ).dump
@@ -545,7 +567,7 @@ summary() {
   [[ $mode == local ]] && scheme=http
   cat <<EOF
 
-$BRAND is running ($env, $mode mode, $LOG_LEVEL logs).
+$BRAND is running ($env, $mode mode, $source binary, $LOG_LEVEL logs).
   Console         $scheme://console.$domain
   Admin           ${first_name:+$first_name $last_name, }$email (the password you chose)
   Health          curl -fsS http://$CONSOLE_ADDR/readyz
@@ -553,7 +575,7 @@ $BRAND is running ($env, $mode mode, $LOG_LEVEL logs).
   CLI             sudo $BRAND --help
   Install log     $LOG
 EOF
-  if [[ $env == development ]]; then
+  if [[ $source == checkout ]]; then
     printf '  Your changes    rebuild and restart with: sudo %s --upgrade\n' "${BASH_SOURCE[0]}"
   fi
   [[ $mode == local ]] || printf '  Network         open TCP 80 and 443; point %s and *.%s at this host (sslip.io does it for you)\n' \
@@ -569,8 +591,8 @@ $upgrade || gather_inputs
 touch "$LOG" && chmod 600 "$LOG"
 exec > >(tee -a "$LOG") 2>&1
 trap 'rc=$?; ((rc == 0)) || printf "\nFailed (exit %s). Full log: %s. Re-running is safe.\n" "$rc" "$LOG" >&2' EXIT
-printf '\n--- %s %s %s (env=%s mode=%s) ---\n' "$BRAND" "$($upgrade && echo upgrade || echo install)" \
-  "$(date -u +%FT%TZ)" "$env" "$mode"
+printf '\n--- %s %s %s (env=%s mode=%s source=%s) ---\n' "$BRAND" "$($upgrade && echo upgrade || echo install)" \
+  "$(date -u +%FT%TZ)" "$env" "$mode" "$source"
 
 if $upgrade; then upgrade; exit 0; fi
 ensure_docker

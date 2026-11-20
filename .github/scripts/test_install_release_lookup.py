@@ -18,8 +18,8 @@ import unittest
 
 
 INSTALLER = Path(__file__).resolve().parents[2] / "scripts" / "install.sh"
-API = "https://api.github.com/repos/gotempsh/temps/"
-DOWNLOAD = "https://github.com/gotempsh/temps/releases/download/"
+API = "https://api.github.com/repos/mck-fake/fuck/"
+DOWNLOAD = "https://github.com/mck-fake/fuck/releases/download/"
 
 FAKE_CURL = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -30,7 +30,7 @@ if "api.github.com" not in url:
     sys.stderr.write("download refused by test\n")
     sys.exit(22)
 routes = json.load(open(os.environ["FAKE_ROUTES"]))
-status, body = routes.get(url.split("/repos/gotempsh/temps/", 1)[1], routes["default"])
+status, body = routes.get(url.split("/repos/mck-fake/fuck/", 1)[1], routes["default"])
 sys.stdout.write(body + "\n" + status)
 '''
 

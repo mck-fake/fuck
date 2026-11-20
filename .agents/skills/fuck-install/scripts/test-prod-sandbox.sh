@@ -38,7 +38,11 @@ done
 [[ $ENV_UNDER_TEST == production || $ENV_UNDER_TEST == development ]] || { echo "--env is production or development" >&2; exit 2; }
 passed=0 failed=0
 
-box() { docker exec -e BRAND="$BRAND" "$NAME" bash -c "$1"; }
+# The production scenario installs and upgrades between two published releases.
+# Until the fork publishes its own, they come from upstream; set
+# TEMPS_RELEASE_REPO=owner/name to test against another repository's releases.
+RELEASE_REPO=${TEMPS_RELEASE_REPO:-gotempsh/temps}
+box() { docker exec -e BRAND="$BRAND" -e TEMPS_RELEASE_REPO="$RELEASE_REPO" "$NAME" bash -c "$1"; }
 check() {
   if box "$2" >/dev/null 2>&1; then
     printf '  PASS  %s\n' "$1"; passed=$((passed + 1))
@@ -124,6 +128,9 @@ fi
 echo "==> Input gates"
 check "rejects an invalid --email" "! $INSTALL --check --mode local --email 'a;b@x.io'"
 check "development refuses --mode public" "! $INSTALL --check --env development --mode public"
+check "rejects an unknown --source" "! $INSTALL --check --mode local --source nightly"
+check "development refuses --source release" "! $INSTALL --check --env development --source release"
+check "--source checkout refuses --version (it builds, it does not download)"   "! $INSTALL --check --mode local --source checkout --version v0.1.0-beta.61"
 check "rejects a weak password before changing anything" \
   "printf 'weakpass\n' > /root/weak; ! $INSTALL --mode local --email a@b.io --first-name A --last-name B --password-file /root/weak </dev/null; [ ! -e /etc/\$BRAND ]"
 check "unattended run without a password stops before changing anything" \
@@ -184,6 +191,8 @@ before=$(box "$SECRETS")
 check "re-run exits 0" "$INSTALL </dev/null"
 same "re-run keeps every secret" "$before" "$(box "$SECRETS")"
 check "a version flag on an existing install points to --upgrade" "! $INSTALL --version v0.1.0-beta.61 </dev/null"
+check "a re-run refuses to switch a loopback install to public"   "! $INSTALL --mode public </dev/null && grep -qx mode=local /etc/\$BRAND/install.conf"
+check "the binary source is remembered as release" 'grep -qx source=release "/etc/$BRAND/install.conf"'
 check "re-run keeps loopback binding" '[ "$(ss -Htln "sport = :80" | awk "{print \$4}" | sort -u)" = 127.0.0.1:80 ]'
 check "/readyz 200 after re-run" "$READY"
 

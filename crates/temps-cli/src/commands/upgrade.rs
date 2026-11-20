@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tempfile::{NamedTempFile, TempPath};
 use tracing::{debug, info};
 
-const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/gotempsh/temps/releases";
+/// The fork's own releases: `temps upgrade` and the console's self-update must
+/// never replace this fork with an upstream Temps binary.
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/mck-fake/fuck/releases";
 
 /// Default base URL of the Temps Cloud license + EE binary proxy. The EE
 /// binary lives in a private repo and is only reachable through this
@@ -1251,7 +1253,7 @@ fn pick_installable_release_for_channel(
 /// **This is a security boundary, not cosmetics.** The tag is interpolated into
 /// a GitHub API path, and the `url` crate resolves `..` segments when parsing —
 /// so an unvalidated tag like `v/../../../../../owner/repo/releases/latest`
-/// walks out of `gotempsh/temps` and resolves to *another repository's* release.
+/// walks out of this repository and resolves to *another repository's* release.
 /// Everything downstream then behaves normally: it downloads that release's
 /// `temps-<target>.tar.gz`, checks it against that release's own `.sha256`
 /// (which of course matches), executes it for the version preflight, and
@@ -2830,9 +2832,19 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_come_from_the_fork_not_upstream() {
+        // An upstream merge that restores the original constant would make
+        // every upgrade replace this fork with upstream Temps.
+        assert_eq!(
+            GITHUB_RELEASES_API,
+            "https://api.github.com/repos/mck-fake/fuck/releases"
+        );
+    }
+
+    #[test]
     fn test_normalize_release_tag_blocks_path_traversal() {
         // The exploit this validation exists for: the `url` crate resolves
-        // `..` segments, so an unvalidated tag escapes gotempsh/temps and
+        // `..` segments, so an unvalidated tag escapes this repository and
         // reaches an arbitrary repository's release — whose asset would then
         // be downloaded, checksum-matched against ITS OWN published hash,
         // executed by the preflight and installed over the running binary.

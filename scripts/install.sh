@@ -140,6 +140,12 @@ github_api_get() {
 # URL, so keep this strict.
 release_tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
 
+# The repository whose releases this installs: the fork's own, so an install
+# or upgrade never swaps the fork for upstream Temps. TEMPS_RELEASE_REPO
+# (owner/name) overrides it, e.g. for installer tests before the fork's first release.
+release_repo=${TEMPS_RELEASE_REPO:-mck-fake/fuck}
+[[ $release_repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || error "TEMPS_RELEASE_REPO must be owner/name, got: $release_repo"
+
 # Print the highest of the tags read from stdin (one per line) by semver
 # precedence: core version first, a release outranks its own prereleases,
 # then prerelease identifiers left to right -- numeric ones compare
@@ -238,7 +244,7 @@ core_version_lt() {
 # the default channel promises, so warn rather than silently switch channels.
 warn_if_stable_predates_beta() {
     local stable_tag="$1" beta_tag
-    github_api_get "https://api.github.com/repos/gotempsh/temps/releases?per_page=100"
+    github_api_get "https://api.github.com/repos/$release_repo/releases?per_page=100"
     [[ "$api_status" = "200" ]] || return 0
     # Same selection as `--channel beta`, limited to the first page: this is
     # only an advisory, so it must not cost the install more API calls.
@@ -249,7 +255,7 @@ warn_if_stable_predates_beta() {
         warning "$stable_tag is the newest stable release, but it predates the current beta
 line (newest: $beta_tag). Temps is in beta, and most installs track the beta channel.
 To install the current beta instead:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- --channel beta
+    curl -fsSL https://raw.githubusercontent.com/$release_repo/main/scripts/install.sh | bash -s -- --channel beta
 "
     fi
 }
@@ -264,9 +270,9 @@ github_api_error() {
     esac
     error "Could not query GitHub for $what: $hint.
 Pin a version to skip the lookup:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- <version>
+    curl -fsSL https://raw.githubusercontent.com/$release_repo/main/scripts/install.sh | bash -s -- <version>
 
-Available versions: https://github.com/gotempsh/temps/releases"
+Available versions: https://github.com/$release_repo/releases"
 }
 
 # Channel selection. Mirrors `temps upgrade --channel`:
@@ -329,7 +335,7 @@ esac
 
 GITHUB=${GITHUB-"https://github.com"}
 
-github_repo="$GITHUB/gotempsh/temps"
+github_repo="$GITHUB/$release_repo"
 
 exe_name=temps
 
@@ -365,7 +371,7 @@ if [[ ${#positional[@]} -eq 0 ]]; then
     set +e
     temps_tag=""
     if [[ "$channel" = "stable" ]]; then
-        github_api_get "https://api.github.com/repos/gotempsh/temps/releases/latest"
+        github_api_get "https://api.github.com/repos/$release_repo/releases/latest"
         case "$api_status" in
             200)
                 # `grep -o` on the key itself, so minified JSON (one line, or
@@ -378,18 +384,18 @@ if [[ ${#positional[@]} -eq 0 ]]; then
                 if [[ -n "$temps_tag" && ! $temps_tag =~ $release_tag_pattern ]]; then
                     error "The latest stable release has an unexpected tag '$temps_tag'.
 Pin a version instead:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- <version>
+    curl -fsSL https://raw.githubusercontent.com/$release_repo/main/scripts/install.sh | bash -s -- <version>
 
-Available versions: https://github.com/gotempsh/temps/releases"
+Available versions: https://github.com/$release_repo/releases"
                 fi
                 stable_installable=$(release_tags_with_asset "$api_body" "$asset_name")
                 if [[ -n "$temps_tag" ]] &&
                    ! printf '%s\n' "$stable_installable" | grep -xF -- "$temps_tag" >/dev/null; then
                     error "The latest stable release $temps_tag has no $asset_name asset, so it cannot be
 installed on this platform. Pin a version that ships one:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- <version>
+    curl -fsSL https://raw.githubusercontent.com/$release_repo/main/scripts/install.sh | bash -s -- <version>
 
-Available versions: https://github.com/gotempsh/temps/releases"
+Available versions: https://github.com/$release_repo/releases"
                 fi
                 ;;
             404)
@@ -402,12 +408,12 @@ Available versions: https://github.com/gotempsh/temps/releases"
 beta or nightly prerelease, so the default 'stable' channel has nothing to install.
 
 To install the newest beta, opt in explicitly:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- --channel beta
+    curl -fsSL https://raw.githubusercontent.com/$release_repo/main/scripts/install.sh | bash -s -- --channel beta
 
 Or pin a specific version:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- <version>
+    curl -fsSL https://raw.githubusercontent.com/$release_repo/main/scripts/install.sh | bash -s -- <version>
 
-Available versions: https://github.com/gotempsh/temps/releases"
+Available versions: https://github.com/$release_repo/releases"
                 ;;
             *)
                 github_api_error "the latest stable release"
@@ -417,7 +423,7 @@ Available versions: https://github.com/gotempsh/temps/releases"
         candidates=""
         page=1
         while [[ $page -le 5 ]]; do
-            github_api_get "https://api.github.com/repos/gotempsh/temps/releases?per_page=100&page=$page"
+            github_api_get "https://api.github.com/repos/$release_repo/releases?per_page=100&page=$page"
             if [[ "$api_status" != "200" ]]; then
                 # Page 1 failing means we know nothing. A later page failing
                 # (typically the unauthenticated rate limit) still leaves the
@@ -446,12 +452,12 @@ Available versions: https://github.com/gotempsh/temps/releases"
         echo ""
         error "No installable release found on channel '$channel' (a release must ship $asset_name).
 Try a specific version:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- v0.1.0
+    curl -fsSL https://raw.githubusercontent.com/$release_repo/main/scripts/install.sh | bash -s -- v0.1.0
 
 Or pick a different channel:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- --channel beta
+    curl -fsSL https://raw.githubusercontent.com/$release_repo/main/scripts/install.sh | bash -s -- --channel beta
 
-Available versions: https://github.com/gotempsh/temps/releases"
+Available versions: https://github.com/$release_repo/releases"
     fi
 
     info "Latest version on $channel: $temps_tag"
@@ -468,7 +474,7 @@ else
 'v0.1.0', '0.1.0' or 'v0.1.0-rc.1'.
 
 Usage: install.sh [--channel stable|beta|nightly] [version]
-Available versions: https://github.com/gotempsh/temps/releases"
+Available versions: https://github.com/$release_repo/releases"
     fi
     info "Installing pinned version: $temps_tag"
 fi
